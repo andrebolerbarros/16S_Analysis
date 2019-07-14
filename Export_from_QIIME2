@@ -1,0 +1,19 @@
+##### These steps should be performed in QIIME2
+
+mkdir phyloseq
+qiime tools export \
+--input-path intermediate_files/table.qza \
+--output-path phyloseq
+
+biom convert \
+  -i phyloseq/feature-table.biom \
+  -o phyloseq/otu_table.txt \
+--to-tsv
+
+qiime tools extract  \
+--input-path taxonomy/taxonomy.qza \
+--output-path phyloseq
+
+qiime tools export \
+--input-path alignment/unrooted-tree.qza \
+--output-path phyloseq
