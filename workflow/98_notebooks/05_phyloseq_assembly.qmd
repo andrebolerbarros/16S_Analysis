@@ -1,0 +1,352 @@
+---
+title: "05 – phyloseq Assembly & Filtering"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+---
+
+# Overview
+
+This notebook builds a clean, analysis-ready **phyloseq** object from the
+decontaminated DADA2 outputs. Steps:
+
+1. Assemble the phyloseq object (OTU table, taxonomy, sample data)
+2. (Optional) Build a phylogenetic tree with DECIPHER + phangorn
+3. Prevalence and count-based filtering
+4. Exploratory taxonomic overview
+5. Save the final object
+
+---
+
+# 1. User Parameters
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+dada2_dir        <- here::here("data", "dada2")
+metadata_path    <- here::here("data", "metadata", "metadata.csv")
+phyloseq_dir     <- here::here("data", "phyloseq")
+controls_ps_path <- file.path(phyloseq_dir, "ps_after_controls_qc.rds")
+
+# ── Metadata ──────────────────────────────────────────────────────────────────
+sample_id_col <- "SampleID"  # Column with unique sample identifiers
+
+# ── Phylogenetic tree construction ────────────────────────────────────────────
+build_tree <- TRUE   # Set FALSE to skip (can be slow for large datasets)
+n_cores    <- 4L
+
+# ── Filtering criteria ────────────────────────────────────────────────────────
+# Remove ASVs not present in at least `min_prevalence` samples
+min_prevalence <- 2   # minimum number of samples an ASV must appear in
+
+# Remove ASVs with fewer than `min_total_count` reads across all samples
+min_total_count <- 5
+
+# ── Taxonomy filters ──────────────────────────────────────────────────────────
+# Remove these taxa (contaminants, off-target amplification)
+remove_kingdoms <- c("Eukaryota", "NA")   # NA = unclassified kingdom
+remove_phyla    <- c()                    # e.g. c("Chloroplast")
+
+# SILVA-specific: remove chloroplast / mitochondria
+remove_class  <- c("Chloroplast")
+remove_family <- c("Mitochondria")
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(DECIPHER)
+  library(phangorn)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+  library(here)
+})
+
+dir.create(phyloseq_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# 3. Load or Build phyloseq Object
+
+## From controls QC output (recommended)
+
+```{r}
+#| label: load-from-controls-qc
+if (file.exists(controls_ps_path)) {
+  ps <- readRDS(controls_ps_path)
+  message("Loaded phyloseq from controls QC: ", controls_ps_path)
+  ps
+} else {
+  message("Controls QC phyloseq not found. Building from DADA2 outputs directly.")
+  build_from_dada2 <- TRUE
+}
+```
+
+## From DADA2 outputs (fallback if notebook 04 was skipped)
+
+```{r}
+#| label: build-from-dada2
+#| eval: !expr !exists("ps")
+seqtab_nochim <- readRDS(file.path(dada2_dir, "seqtab_nochim.rds"))
+taxa          <- readRDS(file.path(dada2_dir, "taxa.rds"))
+metadata      <- read.csv(metadata_path, stringsAsFactors = FALSE)
+rownames(metadata) <- metadata[[sample_id_col]]
+
+ps <- phyloseq(
+  otu_table(seqtab_nochim, taxa_are_rows = FALSE),
+  tax_table(taxa),
+  sample_data(metadata)
+)
+
+# Rename to ASV1, ASV2, ...
+taxa_names(ps) <- paste0("ASV", seq_len(ntaxa(ps)))
+ps
+```
+
+---
+
+# 4. Phylogenetic Tree (Optional)
+
+A phylogenetic tree enables UniFrac distance metrics and Faith's PD. We use
+**DECIPHER** to perform a multiple sequence alignment and **phangorn** to
+construct a maximum-likelihood tree (GTR + G model).
+
+```{r}
+#| label: build-tree
+#| eval: !expr !build_tree
+message("Building phylogenetic tree (this may take several minutes)...")
+
+asv_seqs <- colnames(otu_table(ps))
+if (taxa_are_rows(ps)) asv_seqs <- rownames(otu_table(ps))
+
+# Use stored ASV names
+names(asv_seqs) <- taxa_names(ps)
+
+dna_seqs <- Biostrings::DNAStringSet(asv_seqs)
+
+# Multiple sequence alignment
+message("  Aligning sequences with DECIPHER...")
+alignment <- DECIPHER::AlignSeqs(dna_seqs, anchor = NA, processors = n_cores)
+
+# Convert to phyDat object for phangorn
+phang_align <- phangorn::phyDat(as(alignment, "matrix"), type = "DNA")
+
+# Initial NJ tree
+message("  Building initial NJ tree...")
+dm      <- phangorn::dist.ml(phang_align)
+tree_nj <- phangorn::NJ(dm)
+
+# Fit GTR + G model for ML tree
+message("  Fitting GTR+G maximum-likelihood tree...")
+fit_init     <- phangorn::pml(tree_nj, data = phang_align)
+fit_gtrgamma <- phangorn::optim.pml(
+  fit_init,
+  model         = "GTR",
+  optInv        = TRUE,
+  optGamma      = TRUE,
+  rearrangement = "stochastic",
+  control       = phangorn::pml.control(trace = 0)
+)
+
+phy_tree <- phangorn::midpoint(fit_gtrgamma$tree)
+message("  Tree constructed: ", phangorn::Nnode(phy_tree), " nodes")
+
+# Add tree to phyloseq
+ps <- merge_phyloseq(ps, phy_tree)
+message("Phylogenetic tree added to phyloseq object.")
+```
+
+```{r}
+#| label: tree-plot
+#| eval: !expr !build_tree
+#| fig-width: 6
+#| fig-height: 8
+plot_tree(ps, ladderize = "left", justify = "left",
+          size = "Abundance", color = "Phylum") +
+  ggtitle("Phylogenetic tree coloured by Phylum") +
+  theme(legend.position = "right")
+```
+
+---
+
+# 5. Taxonomic Filtering
+
+Remove non-target sequences (chloroplasts, mitochondria, unclassified kingdoms).
+
+```{r}
+#| label: tax-filter
+ps_tax <- ps
+
+# Remove specified kingdoms
+if (length(remove_kingdoms) > 0) {
+  ps_tax <- subset_taxa(ps_tax,
+    !is.na(Kingdom) & !(Kingdom %in% remove_kingdoms))
+}
+
+# Remove specific phyla
+if (length(remove_phyla) > 0) {
+  ps_tax <- subset_taxa(ps_tax, !(Phylum %in% remove_phyla))
+}
+
+# Remove chloroplasts (Class level)
+if (length(remove_class) > 0) {
+  ps_tax <- subset_taxa(ps_tax, !(Class %in% remove_class))
+}
+
+# Remove mitochondria (Family level)
+if (length(remove_family) > 0) {
+  ps_tax <- subset_taxa(ps_tax, !(Family %in% remove_family))
+}
+
+cat(sprintf("ASVs before taxonomic filtering: %d\n", ntaxa(ps)))
+cat(sprintf("ASVs after  taxonomic filtering: %d\n", ntaxa(ps_tax)))
+```
+
+---
+
+# 6. Prevalence and Count Filtering
+
+```{r}
+#| label: prevalence-filter
+prev_df <- data.frame(
+  ASV        = taxa_names(ps_tax),
+  Prevalence = apply(otu_table(ps_tax), ifelse(taxa_are_rows(ps_tax), 1, 2),
+                      function(x) sum(x > 0)),
+  TotalCount = taxa_sums(ps_tax),
+  stringsAsFactors = FALSE
+)
+
+ggplot(prev_df, aes(x = TotalCount, y = Prevalence)) +
+  geom_point(alpha = 0.4, colour = "steelblue") +
+  geom_vline(xintercept = min_total_count, linetype = "dashed", colour = "red") +
+  geom_hline(yintercept = min_prevalence,  linetype = "dashed", colour = "orange") +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "ASV prevalence vs total read count",
+       subtitle = sprintf("Thresholds: prevalence ≥ %d, count ≥ %d",
+                          min_prevalence, min_total_count),
+       x = "Total reads (log10)", y = "Prevalence (# samples)") +
+  theme_bw()
+```
+
+```{r}
+#| label: apply-filter
+keep_asvs <- prev_df$ASV[prev_df$Prevalence  >= min_prevalence &
+                            prev_df$TotalCount >= min_total_count]
+ps_filt <- prune_taxa(keep_asvs, ps_tax)
+
+cat(sprintf("ASVs before prevalence/count filter: %d\n", ntaxa(ps_tax)))
+cat(sprintf("ASVs after  prevalence/count filter: %d\n", ntaxa(ps_filt)))
+cat(sprintf("Reads retained: %.1f%%\n",
+            100 * sum(otu_table(ps_filt)) / sum(otu_table(ps_tax))))
+```
+
+---
+
+# 7. Exploratory Taxonomic Overview
+
+```{r}
+#| label: phylum-composition
+#| fig-width: 9
+#| fig-height: 5
+ps_rel    <- transform_sample_counts(ps_filt, function(x) x / sum(x))
+ps_phylum <- tax_glom(ps_rel, "Phylum")
+
+plot_bar(ps_phylum, fill = "Phylum") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Phylum-level relative abundance",
+       y = "Relative abundance", x = "Sample") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+```
+
+```{r}
+#| label: top-genera
+#| fig-width: 9
+#| fig-height: 5
+ps_genus   <- tax_glom(ps_rel, "Genus")
+top_genera <- names(sort(taxa_sums(ps_genus), decreasing = TRUE))[1:20]
+
+ps_top <- prune_taxa(top_genera, ps_genus)
+
+plot_bar(ps_top, fill = "Genus") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Top 20 genera by mean relative abundance",
+       y = "Relative abundance", x = "Sample") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+# 8. Sequencing Depth Summary
+
+```{r}
+#| label: depth-summary
+#| fig-width: 7
+#| fig-height: 4
+depth_df <- data.frame(
+  Sample = sample_names(ps_filt),
+  Reads  = sample_sums(ps_filt),
+  stringsAsFactors = FALSE
+)
+
+ggplot(depth_df, aes(x = Reads)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = median(depth_df$Reads),
+             linetype = "dashed", colour = "red") +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "Sequencing depth distribution",
+       subtitle = sprintf("Median: %s reads", format(median(depth_df$Reads), big.mark=",")),
+       x = "Reads per sample", y = "Count") +
+  theme_bw()
+```
+
+---
+
+# 9. Save Final phyloseq Object
+
+```{r}
+#| label: save-final
+saveRDS(ps_filt, file.path(phyloseq_dir, "ps.rds"))
+
+# Also save filtered ASV sequences as FASTA
+actual_seqs <- colnames(otu_table(ps_filt))
+names(actual_seqs) <- taxa_names(ps_filt)
+Biostrings::writeXStringSet(
+  Biostrings::DNAStringSet(actual_seqs),
+  filepath = file.path(phyloseq_dir, "asvs_filtered.fasta")
+)
+
+cat("\nFinal phyloseq object:\n")
+print(ps_filt)
+message("\nSaved to: ", file.path(phyloseq_dir, "ps.rds"))
+```
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

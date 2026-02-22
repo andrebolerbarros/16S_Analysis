@@ -1,0 +1,231 @@
+---
+title: "00 – Environment Setup & Package Installation"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  eval: false   # Set to true only when actively installing
+  message: true
+  warning: true
+---
+
+# Overview
+
+This notebook installs all R packages required by the 16S pipeline and records
+the session environment for reproducibility. Run this **once** before executing
+the analysis notebooks.
+
+::: callout-note
+Set `eval: true` in the `execute` block above (or run each chunk manually)
+when you actually want to install packages. Leaving `eval: false` prevents
+accidental re-installation on every render.
+:::
+
+---
+
+# 1. CRAN Packages
+
+```{r}
+#| label: install-cran
+cran_pkgs <- c(
+  # Core workflow
+  "BiocManager",    # Bioconductor installer
+  "remotes",        # GitHub installs
+  "rmarkdown",      # Report rendering
+  "knitr",          # Knitting
+
+  # Data wrangling & plotting
+  "tidyverse",      # dplyr, tidyr, ggplot2, readr, purrr, forcats, stringr
+  "patchwork",      # Compose ggplot panels
+  "scales",         # Axis formatting
+  "ggrepel",        # Non-overlapping labels
+  "pheatmap",       # Heatmaps
+  "RColorBrewer",   # Colour palettes
+  "viridis",        # Perceptually uniform palettes
+
+  # Compositional statistics
+  "DirichletReg",   # Dirichlet regression for differential abundance
+  "compositions",   # CoDa tools (CLR, ILR)
+
+  # Phylogenetics
+  "ape",            # Phylogenetic tree handling
+  "phangorn",       # Tree construction (NJ + GTR)
+
+  # Diversity
+  "vegan",          # Community ecology (PERMANOVA, NMDS, etc.)
+
+  # Utilities
+  "jsonlite",       # JSON I/O (rFigaro dependency)
+  "parallel",       # Parallel processing
+  "here"            # Relative paths
+)
+
+installed <- rownames(installed.packages())
+to_install <- setdiff(cran_pkgs, installed)
+
+if (length(to_install) > 0) {
+  message("Installing from CRAN: ", paste(to_install, collapse = ", "))
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+} else {
+  message("All CRAN packages already installed.")
+}
+```
+
+---
+
+# 2. Bioconductor Packages
+
+```{r}
+#| label: install-bioc
+bioc_pkgs <- c(
+  # 16S / amplicon
+  "dada2",          # ASV denoising (core pipeline step)
+  "DECIPHER",       # Taxonomic classification (IdTaxa)
+  "decontam",       # Contaminant identification
+  "phyloseq",       # Microbiome data container & ecology
+  "microbiome",     # phyloseq extensions and utilities
+
+  # Differential abundance
+  "ANCOMBC",        # ANCOM-BC2 – compositionally aware DA testing
+
+  # Diversity with bias correction
+  "breakaway",      # Bias-corrected richness & betta() regression
+  "DivNet",         # Network-aware diversity estimation (Shannon, Simpson)
+
+  # Quality & short reads
+  "ShortRead",      # FASTQ I/O (also used by rFigaro optionally)
+  "Biostrings"      # DNA string manipulation
+)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+installed_bioc <- rownames(installed.packages())
+to_install_bioc <- setdiff(bioc_pkgs, installed_bioc)
+
+if (length(to_install_bioc) > 0) {
+  message("Installing from Bioconductor: ", paste(to_install_bioc, collapse = ", "))
+  BiocManager::install(to_install_bioc, ask = FALSE)
+} else {
+  message("All Bioconductor packages already installed.")
+}
+```
+
+---
+
+# 3. rFigaro (Local)
+
+The `rFigaro` package is included as a local source in `rFigaro/`. Install it
+once from source:
+
+```{r}
+#| label: install-rfigaro
+rfigaro_path <- here::here("rFigaro")
+
+if (!requireNamespace("rFigaro", quietly = TRUE)) {
+  message("Installing rFigaro from local source: ", rfigaro_path)
+  remotes::install_local(rfigaro_path, upgrade = "never")
+} else {
+  message("rFigaro already installed. Version: ",
+          packageVersion("rFigaro"))
+}
+```
+
+To force reinstall (e.g., after updating the package source):
+
+```{r}
+#| label: reinstall-rfigaro
+remotes::install_local(here::here("rFigaro"), force = TRUE, upgrade = "never")
+```
+
+---
+
+# 4. External Tool: cutadapt
+
+Primer trimming uses **cutadapt** (Python), called from R via `system2()`.
+Install it outside R:
+
+```{bash}
+#| label: install-cutadapt
+# Option A – conda/mamba (recommended)
+mamba install -c bioconda cutadapt
+
+# Option B – pip
+pip install cutadapt
+
+# Verify
+cutadapt --version
+```
+
+Verify that R can find it:
+
+```{r}
+#| label: check-cutadapt
+#| eval: true
+cutadapt_check <- system2("cutadapt", "--version", stdout = TRUE, stderr = TRUE)
+if (length(cutadapt_check) > 0) {
+  cat("cutadapt found:", cutadapt_check[1], "\n")
+} else {
+  warning("cutadapt not found in PATH. Set `cutadapt_path` manually in notebook 01.")
+}
+```
+
+---
+
+# 5. Verify Installation
+
+```{r}
+#| label: verify
+#| eval: true
+pkgs_to_check <- c(
+  "dada2", "phyloseq", "DECIPHER", "decontam",
+  "ANCOMBC", "breakaway", "DivNet",
+  "vegan", "DirichletReg", "microbiome",
+  "ape", "phangorn", "ShortRead",
+  "ggplot2", "dplyr", "tidyr", "patchwork"
+)
+
+status <- sapply(pkgs_to_check, function(p) {
+  tryCatch({
+    requireNamespace(p, quietly = TRUE)
+    as.character(packageVersion(p))
+  }, error = function(e) "NOT INSTALLED")
+})
+
+df <- data.frame(
+  Package = names(status),
+  Version = unname(status),
+  Status  = ifelse(status == "NOT INSTALLED", "MISSING", "OK"),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(df, caption = "Package installation status")
+```
+
+```{r}
+#| label: verify-rfigaro
+#| eval: true
+rfig_ok <- requireNamespace("rFigaro", quietly = TRUE)
+cat("rFigaro installed:", rfig_ok, "\n")
+if (rfig_ok) cat("rFigaro version:", as.character(packageVersion("rFigaro")), "\n")
+```
+
+---
+
+# 6. Session Information
+
+```{r}
+#| label: session-info
+#| eval: true
+sessionInfo()
+```

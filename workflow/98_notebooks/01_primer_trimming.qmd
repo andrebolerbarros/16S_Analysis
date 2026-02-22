@@ -1,0 +1,359 @@
+---
+title: "01 – Primer Trimming"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+---
+
+# Overview
+
+This notebook removes primer sequences from raw paired-end FASTQ files using
+**cutadapt**. Only reads in which both primers are found (and removed) are
+retained; spurious primer-less reads are discarded.
+
+The workflow:
+
+1. Locate raw FASTQ files
+2. Inspect a quality profile of raw reads
+3. Run cutadapt on each sample (parallelised)
+4. Verify trimming success
+
+---
+
+# 1. User Parameters
+
+::: callout-important
+Edit this section before running the notebook.
+:::
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+raw_dir     <- here::here("data", "raw")         # Directory with raw FASTQs
+trimmed_dir <- here::here("data", "trimmed")     # Output for trimmed FASTQs
+cutadapt_path <- "cutadapt"  # Full path if not in PATH, e.g. "/usr/bin/cutadapt"
+
+# ── Primers (5' → 3', without ambiguity codes unless intentional) ─────────────
+# 515F / 806R (Parada et al. 2016 / Apprill et al. 2015) – V4 region example
+primer_fwd <- "GTGYCAGCMGCCGCGGTAA"   # Forward primer
+primer_rev <- "GGACTACNVGGGTWTCTAAT" # Reverse primer
+
+# ── Cutadapt settings ─────────────────────────────────────────────────────────
+min_length        <- 50     # Discard reads shorter than this after trimming (bp)
+error_rate        <- 0.1    # Maximum error rate for primer matching (0–1)
+discard_untrimmed <- TRUE   # Discard reads where the primer was not found
+n_cores           <- 4      # Parallel jobs (set to 1 if issues arise)
+
+# ── FASTQ naming convention ────────────────────────────────────────────────────
+# Pattern to identify forward and reverse reads in filename
+fwd_pattern <- "_R1"   # e.g. sample1_R1.fastq.gz
+rev_pattern <- "_R2"
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(dada2)
+  library(ShortRead)
+  library(ggplot2)
+  library(dplyr)
+  library(here)
+})
+```
+
+```{r}
+#| label: create-dirs
+dir.create(trimmed_dir, recursive = TRUE, showWarnings = FALSE)
+message("Trimmed FASTQ output directory: ", trimmed_dir)
+```
+
+```{r}
+#| label: check-cutadapt
+ca_version <- tryCatch(
+  system2(cutadapt_path, "--version", stdout = TRUE, stderr = TRUE),
+  error = function(e) NULL
+)
+
+if (is.null(ca_version) || length(ca_version) == 0) {
+  stop(
+    "cutadapt not found at: ", cutadapt_path,
+    "\nInstall cutadapt (see docs/00_setup.qmd) or update `cutadapt_path`."
+  )
+}
+cat("cutadapt version:", ca_version[1], "\n")
+```
+
+---
+
+# 3. Locate Raw FASTQ Files
+
+```{r}
+#| label: list-fastqs
+fwd_files <- sort(list.files(raw_dir, pattern = paste0(fwd_pattern, ".*\\.fastq(\\.gz)?$"),
+                              full.names = TRUE))
+rev_files <- sort(list.files(raw_dir, pattern = paste0(rev_pattern, ".*\\.fastq(\\.gz)?$"),
+                              full.names = TRUE))
+
+if (length(fwd_files) == 0) stop("No forward FASTQ files found in: ", raw_dir)
+if (length(fwd_files) != length(rev_files)) {
+  stop("Unequal number of forward (", length(fwd_files),
+       ") and reverse (", length(rev_files), ") files.")
+}
+
+# Extract sample names (everything before the R1/R2 pattern)
+sample_names <- sub(paste0(fwd_pattern, ".*"), "", basename(fwd_files))
+# Remove trailing separator characters
+sample_names <- gsub("[._-]$", "", sample_names)
+
+cat("Samples found:", length(sample_names), "\n")
+head(data.frame(Sample = sample_names,
+                Forward = basename(fwd_files),
+                Reverse = basename(rev_files)), 10)
+```
+
+---
+
+# 4. Raw Quality Profiles
+
+Visualise quality profiles for a random subset of samples before trimming.
+This helps confirm primer presence and assess overall read quality.
+
+```{r}
+#| label: raw-quality
+#| fig-width: 10
+#| fig-height: 5
+n_plot <- min(4, length(fwd_files))
+idx    <- sort(sample(length(fwd_files), n_plot))
+
+p_fwd <- plotQualityProfile(fwd_files[idx]) +
+  ggtitle("Raw forward reads – quality profiles") +
+  theme_bw()
+
+p_rev <- plotQualityProfile(rev_files[idx]) +
+  ggtitle("Raw reverse reads – quality profiles") +
+  theme_bw()
+
+print(p_fwd)
+print(p_rev)
+```
+
+---
+
+# 5. Check Primer Orientation
+
+Primers can appear in multiple orientations. We check all four orientations
+(forward, complement, reverse complement, reverse) to ensure we capture them all.
+
+```{r}
+#| label: primer-utils
+# Orientation helper functions
+rc <- function(seq) as.character(Biostrings::reverseComplement(Biostrings::DNAString(seq)))
+
+primer_orientations <- function(primer) {
+  c(
+    Forward    = primer,
+    Complement = as.character(Biostrings::complement(Biostrings::DNAString(primer))),
+    RevComp    = rc(primer),
+    Reverse    = paste(rev(strsplit(primer, "")[[1]]), collapse = "")
+  )
+}
+
+fwd_orients <- primer_orientations(primer_fwd)
+rev_orients <- primer_orientations(primer_rev)
+
+cat("Forward primer orientations:\n"); print(fwd_orients)
+cat("\nReverse primer orientations:\n"); print(rev_orients)
+```
+
+```{r}
+#| label: count-primers
+count_primers <- function(primer, file_path) {
+  hits <- vcountPattern(primer,
+                        sread(readFastq(file_path)),
+                        fixed = FALSE)
+  sum(hits > 0)
+}
+
+# Count occurrences in first sample only (as a check)
+cat("\nPrimer counts in first sample forward read:\n")
+sapply(fwd_orients, count_primers, file_path = fwd_files[1])
+
+cat("\nPrimer counts in first sample reverse read:\n")
+sapply(rev_orients, count_primers, file_path = rev_files[1])
+```
+
+---
+
+# 6. Run Cutadapt
+
+Cutadapt is run for each sample. We trim:
+
+- The forward primer from the 5' end of R1 reads
+- The reverse complement of the reverse primer from the 3' end of R1 reads
+- The reverse primer from the 5' end of R2 reads
+- The reverse complement of the forward primer from the 3' end of R2 reads
+
+```{r}
+#| label: define-outputs
+fwd_trimmed <- file.path(trimmed_dir, basename(fwd_files))
+rev_trimmed <- file.path(trimmed_dir, basename(rev_files))
+```
+
+```{r}
+#| label: run-cutadapt
+# Build cutadapt flags
+flags_base <- c(
+  "-g", primer_fwd,         # 5' adapter on R1
+  "-a", rc(primer_rev),     # 3' adapter on R1 (RC of rev primer)
+  "-G", primer_rev,         # 5' adapter on R2
+  "-A", rc(primer_fwd),     # 3' adapter on R2 (RC of fwd primer)
+  "-m", min_length,
+  "--error-rate", error_rate,
+  if (discard_untrimmed) "--discard-untrimmed",
+  "-j", n_cores             # parallel
+)
+
+cutadapt_log <- vector("list", length(sample_names))
+names(cutadapt_log) <- sample_names
+
+for (i in seq_along(sample_names)) {
+  flags <- c(
+    flags_base,
+    "-o", fwd_trimmed[i],
+    "-p", rev_trimmed[i],
+    fwd_files[i],
+    rev_files[i]
+  )
+
+  log_out <- system2(cutadapt_path, args = flags,
+                     stdout = TRUE, stderr = TRUE)
+  cutadapt_log[[i]] <- log_out
+
+  # Parse read retention from cutadapt output
+  pairs_in  <- grep("Total read pairs processed", log_out, value = TRUE)
+  pairs_out <- grep("Pairs written", log_out, value = TRUE)
+  cat(sprintf("[%d/%d] %s | %s | %s\n",
+              i, length(sample_names), sample_names[i],
+              ifelse(length(pairs_in)  > 0, trimws(pairs_in[1]),  "?"),
+              ifelse(length(pairs_out) > 0, trimws(pairs_out[1]), "?")))
+}
+
+message("Primer trimming complete.")
+```
+
+---
+
+# 7. Trimming Summary
+
+```{r}
+#| label: trimming-summary
+parse_cutadapt_log <- function(log_lines, sample) {
+  extract_n <- function(pattern) {
+    line <- grep(pattern, log_lines, value = TRUE)[1]
+    if (is.na(line)) return(NA_integer_)
+    as.integer(gsub("[^0-9]", "", regmatches(line, regexpr("[0-9,]+", line))))
+  }
+  data.frame(
+    Sample      = sample,
+    Pairs_in    = extract_n("Total read pairs processed"),
+    Pairs_out   = extract_n("Pairs written"),
+    stringsAsFactors = FALSE
+  )
+}
+
+summary_df <- do.call(rbind, Map(parse_cutadapt_log,
+                                  cutadapt_log, sample_names))
+summary_df <- summary_df %>%
+  dplyr::mutate(
+    Retention_pct = round(Pairs_out / Pairs_in * 100, 1)
+  )
+
+knitr::kable(summary_df, caption = "Cutadapt read retention per sample")
+```
+
+```{r}
+#| label: retention-plot
+#| fig-width: 8
+#| fig-height: 4
+ggplot(summary_df, aes(x = reorder(Sample, Retention_pct),
+                        y = Retention_pct,
+                        fill = Retention_pct < 70)) +
+  geom_col() +
+  geom_hline(yintercept = 70, linetype = "dashed", colour = "red") +
+  scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "tomato"),
+                    guide  = "none") +
+  coord_flip() +
+  labs(title = "Read retention after primer trimming",
+       x = NULL, y = "Pairs retained (%)") +
+  theme_bw()
+```
+
+::: callout-warning
+Samples with < 70% retention (red) may have sequencing issues or an incorrect
+primer specification. Check the cutadapt logs.
+:::
+
+---
+
+# 8. Post-trimming Quality Profiles
+
+```{r}
+#| label: trimmed-quality
+#| fig-width: 10
+#| fig-height: 5
+p_fwd_t <- plotQualityProfile(fwd_trimmed[idx]) +
+  ggtitle("Trimmed forward reads – quality profiles") +
+  theme_bw()
+
+p_rev_t <- plotQualityProfile(rev_trimmed[idx]) +
+  ggtitle("Trimmed reverse reads – quality profiles") +
+  theme_bw()
+
+print(p_fwd_t)
+print(p_rev_t)
+```
+
+---
+
+# 9. Save Sample Manifest
+
+```{r}
+#| label: save-manifest
+manifest <- data.frame(
+  Sample   = sample_names,
+  Fwd_raw  = fwd_files,
+  Rev_raw  = rev_files,
+  Fwd_trim = fwd_trimmed,
+  Rev_trim = rev_trimmed,
+  stringsAsFactors = FALSE
+)
+
+manifest_path <- here::here("data", "trimmed", "sample_manifest.csv")
+write.csv(manifest, manifest_path, row.names = FALSE)
+message("Sample manifest saved to: ", manifest_path)
+```
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

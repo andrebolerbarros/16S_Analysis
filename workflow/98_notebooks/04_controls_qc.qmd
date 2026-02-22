@@ -1,0 +1,421 @@
+---
+title: "04 – Negative & Positive Controls QC"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+---
+
+# Overview
+
+This notebook assesses the quality of **negative controls** (extraction blanks,
+PCR no-template controls) and **positive controls** (mock communities), and
+removes contaminants identified from negative controls before downstream analysis.
+
+**Negative controls:** Detect and remove ASVs introduced by reagent or
+laboratory contamination using the `decontam` package.
+
+**Positive controls:** Compare observed composition to the expected mock
+community composition to assess sequencing accuracy and DADA2 performance.
+
+---
+
+# 1. User Parameters
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+dada2_dir     <- here::here("data", "dada2")
+metadata_path <- here::here("data", "metadata", "metadata.csv")
+phyloseq_dir  <- here::here("data", "phyloseq")
+
+# ── Metadata column names ─────────────────────────────────────────────────────
+sample_id_col   <- "SampleID"    # Column with sample identifiers
+sample_type_col <- "SampleType"  # Column indicating "Sample", "NegControl", "PosControl"
+dna_conc_col    <- "DNAConc_ng"  # (Optional) DNA concentration for frequency method
+
+# ── decontam settings ─────────────────────────────────────────────────────────
+decontam_method    <- "prevalence"  # "prevalence", "frequency", or "combined"
+decontam_threshold <- 0.1           # Probability threshold for calling contaminants
+
+# ── Positive control: expected composition ────────────────────────────────────
+# Provide expected genus-level composition of your mock community.
+# Leave NULL to skip mock community evaluation.
+# Example: ZymoBIOMICS D6305 mock (8 bacterial, 2 fungal species – bacteria only shown)
+mock_expected <- data.frame(
+  Genus        = c("Listeria", "Pseudomonas", "Bacillus", "Lactobacillus",
+                   "Escherichia", "Salmonella", "Enterococcus", "Staphylococcus"),
+  Expected_pct = c(12, 12, 12, 12, 12, 12, 12, 12),
+  stringsAsFactors = FALSE
+)
+# Set NULL if no positive control in your experiment:
+# mock_expected <- NULL
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(decontam)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(here)
+})
+
+dir.create(phyloseq_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# 3. Load Data
+
+```{r}
+#| label: load-dada2
+seqtab_nochim <- readRDS(file.path(dada2_dir, "seqtab_nochim.rds"))
+taxa          <- readRDS(file.path(dada2_dir, "taxa.rds"))
+metadata      <- read.csv(metadata_path, stringsAsFactors = FALSE)
+rownames(metadata) <- metadata[[sample_id_col]]
+
+cat("Samples in seqtab:", nrow(seqtab_nochim), "\n")
+cat("Samples in metadata:", nrow(metadata), "\n")
+cat("ASVs:", ncol(seqtab_nochim), "\n")
+```
+
+```{r}
+#| label: sample-type-check
+if (!sample_type_col %in% colnames(metadata)) {
+  stop("Column '", sample_type_col, "' not found in metadata.\n",
+       "Please add a column indicating 'Sample', 'NegControl', or 'PosControl'.")
+}
+
+cat("\nSample type counts:\n")
+print(table(metadata[[sample_type_col]]))
+```
+
+```{r}
+#| label: build-ps-raw
+# Build a preliminary phyloseq object for decontam
+# (no tree yet – that comes in notebook 05)
+ps_raw <- phyloseq(
+  otu_table(seqtab_nochim, taxa_are_rows = FALSE),
+  tax_table(taxa),
+  sample_data(metadata)
+)
+
+# Rename ASVs for readability
+dna <- Biostrings::DNAStringSet(taxa_names(ps_raw))
+names(dna) <- paste0("ASV", seq_along(dna))
+taxa_names(ps_raw) <- names(dna)
+
+ps_raw
+```
+
+---
+
+# 4. Negative Controls – Contamination Detection
+
+## 4.1 Identify Negative Controls
+
+```{r}
+#| label: id-neg-controls
+sample_data(ps_raw)$is_neg <- sample_data(ps_raw)[[sample_type_col]] == "NegControl"
+
+n_neg <- sum(sample_data(ps_raw)$is_neg)
+n_pos <- sum(sample_data(ps_raw)[[sample_type_col]] == "PosControl")
+n_smp <- sum(sample_data(ps_raw)[[sample_type_col]] == "Sample")
+
+cat(sprintf("  True samples:      %d\n", n_smp))
+cat(sprintf("  Negative controls: %d\n", n_neg))
+cat(sprintf("  Positive controls: %d\n", n_pos))
+
+if (n_neg == 0) {
+  warning("No negative controls found. Skipping decontam analysis.")
+}
+```
+
+## 4.2 Read Count in Negative Controls
+
+```{r}
+#| label: neg-control-reads
+#| fig-width: 8
+#| fig-height: 4
+read_counts <- data.frame(
+  Sample = sample_names(ps_raw),
+  Reads  = sample_sums(ps_raw),
+  Type   = sample_data(ps_raw)[[sample_type_col]],
+  stringsAsFactors = FALSE
+)
+
+ggplot(read_counts, aes(x = reorder(Sample, Reads), y = Reads, fill = Type)) +
+  geom_col() +
+  scale_fill_manual(values = c(Sample = "steelblue", NegControl = "tomato",
+                                PosControl = "goldenrod")) +
+  scale_y_log10(labels = scales::comma) +
+  coord_flip() +
+  labs(title = "Read counts per sample",
+       x = NULL, y = "Reads (log10)", fill = "Type") +
+  theme_bw()
+```
+
+## 4.3 Run decontam
+
+```{r}
+#| label: run-decontam
+if (n_neg > 0) {
+  if (decontam_method %in% c("frequency", "combined")) {
+    if (!dna_conc_col %in% colnames(sample_data(ps_raw))) {
+      warning("DNA concentration column '", dna_conc_col, "' not found.\n",
+              "Falling back to prevalence method.")
+      decontam_method <- "prevalence"
+    } else {
+      sample_data(ps_raw)$quant_reading <- sample_data(ps_raw)[[dna_conc_col]]
+    }
+  }
+
+  contam_result <- isContaminant(
+    ps_raw,
+    method    = decontam_method,
+    neg       = "is_neg",
+    threshold = decontam_threshold,
+    detailed  = TRUE
+  )
+
+  n_contam <- sum(contam_result$contaminant, na.rm = TRUE)
+  cat(sprintf("\nContaminants identified: %d / %d ASVs (%.1f%%)\n",
+              n_contam, nrow(contam_result),
+              100 * n_contam / nrow(contam_result)))
+}
+```
+
+## 4.4 Inspect Contaminant Scores
+
+```{r}
+#| label: decontam-scores-plot
+#| fig-width: 7
+#| fig-height: 4
+if (n_neg > 0 && exists("contam_result")) {
+  ggplot(contam_result, aes(x = p, fill = contaminant)) +
+    geom_histogram(bins = 30, colour = "white") +
+    scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "tomato"),
+                      labels = c("Not contaminant", "Contaminant")) +
+    geom_vline(xintercept = decontam_threshold, linetype = "dashed") +
+    labs(title = "decontam – contaminant probability distribution",
+         x = "p (probability of being a contaminant)",
+         y = "Number of ASVs",
+         fill = NULL) +
+    theme_bw()
+}
+```
+
+## 4.5 Inspect Contaminant Taxa
+
+```{r}
+#| label: contam-taxa-table
+if (n_neg > 0 && exists("contam_result")) {
+  contam_asvs <- rownames(contam_result)[contam_result$contaminant & !is.na(contam_result$contaminant)]
+
+  if (length(contam_asvs) > 0) {
+    contam_tax <- as.data.frame(tax_table(ps_raw)[contam_asvs, ])
+    contam_tax$ASV <- contam_asvs
+    contam_tax$p_contam <- contam_result[contam_asvs, "p"]
+    knitr::kable(contam_tax[order(contam_tax$p_contam), ],
+                 caption = "Putative contaminant ASVs",
+                 row.names = FALSE)
+  } else {
+    cat("No contaminants detected at threshold p <", decontam_threshold, "\n")
+  }
+}
+```
+
+## 4.6 Prevalence Pattern: Contaminants vs True Taxa
+
+A true contaminant should appear more prevalently in negative controls
+(low DNA input) relative to true samples.
+
+```{r}
+#| label: prevalence-plot
+#| fig-width: 7
+#| fig-height: 5
+if (n_neg > 0 && exists("contam_result") && n_contam > 0) {
+  ps_neg <- prune_samples(sample_data(ps_raw)$is_neg, ps_raw)
+  ps_smp <- prune_samples(!sample_data(ps_raw)$is_neg, ps_raw)
+
+  prev_neg <- apply(otu_table(ps_neg), 2, function(x) mean(x > 0))
+  prev_smp <- apply(otu_table(ps_smp), 2, function(x) mean(x > 0))
+
+  prev_df <- data.frame(
+    ASV         = names(prev_neg),
+    Prev_neg    = prev_neg,
+    Prev_sample = prev_smp,
+    Contaminant = contam_result[names(prev_neg), "contaminant"],
+    stringsAsFactors = FALSE
+  )
+
+  ggplot(prev_df, aes(x = Prev_neg, y = Prev_sample,
+                       colour = Contaminant)) +
+    geom_point(alpha = 0.6) +
+    scale_colour_manual(values = c("FALSE" = "steelblue", "TRUE" = "tomato")) +
+    labs(title = "ASV prevalence: negative controls vs samples",
+         x = "Prevalence in negative controls",
+         y = "Prevalence in true samples",
+         colour = "Contaminant") +
+    theme_bw()
+}
+```
+
+---
+
+# 5. Remove Contaminants
+
+```{r}
+#| label: remove-contaminants
+if (n_neg > 0 && exists("contam_result") && n_contam > 0) {
+  ps_clean <- prune_taxa(!contam_result$contaminant | is.na(contam_result$contaminant),
+                          ps_raw)
+  cat(sprintf("ASVs before removal: %d\n", ntaxa(ps_raw)))
+  cat(sprintf("ASVs after  removal: %d\n", ntaxa(ps_clean)))
+} else {
+  ps_clean <- ps_raw
+  message("No contaminants removed.")
+}
+
+# Remove negative controls from downstream analysis
+ps_nocontrols <- subset_samples(ps_clean,
+                                 sample_data(ps_clean)[[sample_type_col]] != "NegControl")
+cat(sprintf("\nSamples after removing negative controls: %d\n", nsamples(ps_nocontrols)))
+```
+
+---
+
+# 6. Positive Controls – Mock Community Assessment
+
+## 6.1 Extract Mock Samples
+
+```{r}
+#| label: extract-mock
+if (!is.null(mock_expected) &&
+    any(sample_data(ps_clean)[[sample_type_col]] == "PosControl")) {
+
+  ps_mock <- subset_samples(ps_clean,
+                              sample_data(ps_clean)[[sample_type_col]] == "PosControl")
+  cat("Mock community samples:", nsamples(ps_mock), "\n")
+  cat("ASVs detected in mock:", ntaxa(prune_taxa(taxa_sums(ps_mock) > 0, ps_mock)), "\n")
+} else {
+  message("No positive controls found or expected composition not provided. Skipping mock assessment.")
+  ps_mock <- NULL
+}
+```
+
+## 6.2 Genus-level Composition vs Expected
+
+```{r}
+#| label: mock-composition
+#| fig-width: 8
+#| fig-height: 5
+if (!is.null(ps_mock)) {
+  # Aggregate to genus level
+  ps_mock_genus <- tax_glom(ps_mock, "Genus")
+  mock_rel <- transform_sample_counts(ps_mock_genus, function(x) 100 * x / sum(x))
+
+  mock_obs_df <- psmelt(mock_rel) %>%
+    group_by(Genus) %>%
+    summarise(Observed_pct = mean(Abundance), .groups = "drop") %>%
+    filter(Observed_pct >= 1)  # Only show genera with >=1%
+
+  # Merge with expected
+  mock_compare <- merge(mock_obs_df, mock_expected, by = "Genus", all = TRUE)
+  mock_compare[is.na(mock_compare)] <- 0
+
+  mock_long <- tidyr::pivot_longer(
+    mock_compare,
+    cols      = c("Observed_pct", "Expected_pct"),
+    names_to  = "Source",
+    values_to = "Percent"
+  )
+
+  ggplot(mock_long, aes(x = reorder(Genus, Percent),
+                         y = Percent,
+                         fill = Source)) +
+    geom_col(position = "dodge") +
+    coord_flip() +
+    scale_fill_manual(values = c(Expected_pct = "grey60", Observed_pct = "steelblue")) +
+    labs(title = "Positive control: observed vs expected composition",
+         x = NULL, y = "Relative abundance (%)", fill = NULL) +
+    theme_bw()
+}
+```
+
+## 6.3 Sequence Accuracy: Error Rate Estimate
+
+```{r}
+#| label: mock-error-rate
+if (!is.null(ps_mock)) {
+  mock_asvs_rel <- transform_sample_counts(ps_mock, function(x) x / sum(x))
+  mock_asv_tab  <- otu_table(mock_asvs_rel)
+
+  total_mock_asvs <- sum(colSums(as.data.frame(otu_table(ps_mock))) > 0)
+  expected_genera <- mock_expected$Genus
+  mock_tax        <- as.data.frame(tax_table(ps_mock))
+
+  true_asvs  <- sum(mock_tax$Genus %in% expected_genera &
+                      taxa_sums(ps_mock) > 0)
+  error_asvs <- total_mock_asvs - true_asvs
+
+  cat(sprintf("Total ASVs in mock:            %d\n", total_mock_asvs))
+  cat(sprintf("ASVs matching expected genera: %d\n", true_asvs))
+  cat(sprintf("Spurious ASVs (potential errors): %d (%.1f%%)\n",
+              error_asvs, 100 * error_asvs / total_mock_asvs))
+}
+```
+
+---
+
+# 7. Save Cleaned Phyloseq Object
+
+```{r}
+#| label: save-ps-clean
+ps_for_downstream <- ps_nocontrols
+
+# Also remove positive controls
+ps_for_downstream <- subset_samples(
+  ps_for_downstream,
+  sample_data(ps_for_downstream)[[sample_type_col]] == "Sample"
+)
+
+# Drop ASVs with zero counts after sample removal
+ps_for_downstream <- prune_taxa(taxa_sums(ps_for_downstream) > 0, ps_for_downstream)
+
+cat(sprintf("\nFinal dataset after QC:\n"))
+cat(sprintf("  Samples: %d\n", nsamples(ps_for_downstream)))
+cat(sprintf("  ASVs:    %d\n", ntaxa(ps_for_downstream)))
+
+saveRDS(ps_for_downstream, file.path(phyloseq_dir, "ps_after_controls_qc.rds"))
+message("Cleaned phyloseq object saved to: ",
+        file.path(phyloseq_dir, "ps_after_controls_qc.rds"))
+```
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

@@ -1,0 +1,465 @@
+---
+title: "06 – Diversity Analysis"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+  fig-width: 8
+  fig-height: 5
+---
+
+# Overview
+
+This notebook computes alpha and beta diversity. A key feature is the use of
+**bias-corrected** richness and diversity estimators:
+
+| Estimator | Package | Bias correction |
+|-----------|---------|----------------|
+| Observed richness | base | None (underestimates true richness) |
+| breakaway S | **breakaway** | Ratio estimator; robust to library depth |
+| Shannon H′ | **DivNet** | Network-aware; accounts for correlation structure |
+| Simpson (1–D) | **DivNet** | Network-aware |
+| Faith's PD | phyloseq + picante | None; uses phylogenetic tree |
+
+For beta diversity we use Bray-Curtis, weighted/unweighted UniFrac, and
+Aitchison distance (CLR-transformed), with PERMANOVA and PERMDISP tests.
+
+---
+
+# 1. User Parameters
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+phyloseq_dir <- here::here("data", "phyloseq")
+ps_path      <- file.path(phyloseq_dir, "ps.rds")
+results_dir  <- here::here("data", "diversity")
+
+# ── Study design ──────────────────────────────────────────────────────────────
+group_var      <- "Group"   # Metadata column for group comparisons
+# (Optional) Covariates for DivNet / betta regression
+covariate_vars <- c()       # e.g. c("Age", "Sex")
+
+# ── Rarefaction ───────────────────────────────────────────────────────────────
+# For standard (non-bias-corrected) metrics only.
+# Set to NULL to use minimum library depth.
+rarefy_depth <- NULL   # e.g. 5000; or NULL
+
+# ── DivNet settings ───────────────────────────────────────────────────────────
+# DivNet fits a network model; B controls bootstrap samples (default 5 is fast)
+divnet_tuning <- "fast"  # "fast" (B=5) or "careful" (B=10)
+
+# ── Statistical test for alpha diversity ──────────────────────────────────────
+alpha_stat_test <- "betta"  # "betta" (breakaway), "wilcox", or "kruskal"
+alpha_p_adjust  <- "BH"     # Method for multiple comparison correction
+
+# ── Beta diversity ────────────────────────────────────────────────────────────
+beta_distances <- c("bray", "wunifrac", "unifrac", "aitchison")
+n_permutations <- 999   # PERMANOVA permutations
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(breakaway)
+  library(DivNet)
+  library(vegan)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(here)
+})
+
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# 3. Load Data
+
+```{r}
+#| label: load-ps
+ps <- readRDS(ps_path)
+ps
+```
+
+```{r}
+#| label: check-group-var
+if (!group_var %in% colnames(sample_data(ps))) {
+  stop("Group variable '", group_var, "' not found in sample metadata.\n",
+       "Available columns: ", paste(colnames(sample_data(ps)), collapse = ", "))
+}
+
+groups <- sample_data(ps)[[group_var]]
+cat("Groups:", paste(unique(groups), collapse = ", "), "\n")
+cat("Group sizes:\n"); print(table(groups))
+```
+
+---
+
+# 4. Alpha Diversity
+
+## 4.1 Standard Metrics (Rarefied Data)
+
+Standard alpha diversity metrics are computed on a rarefied (subsampled) table
+to equalise library depth. Note that rarefaction discards data and is
+controversial; bias-corrected estimates (below) are preferred.
+
+```{r}
+#| label: rarefy
+set.seed(42)
+
+if (is.null(rarefy_depth)) {
+  rarefy_depth <- min(sample_sums(ps))
+  message("Rarefying to minimum depth: ", format(rarefy_depth, big.mark=","))
+}
+
+ps_rare <- rarefy_even_depth(ps, sample.size = rarefy_depth,
+                               rngseed = 42, verbose = FALSE)
+cat(sprintf("Samples retained after rarefaction: %d\n", nsamples(ps_rare)))
+```
+
+```{r}
+#| label: standard-alpha
+#| fig-width: 10
+#| fig-height: 5
+alpha_std <- estimate_richness(ps_rare,
+  measures = c("Observed", "Shannon", "Simpson", "Chao1", "ACE"))
+alpha_std$Sample <- rownames(alpha_std)
+alpha_std$Group  <- sample_data(ps_rare)[[group_var]]
+
+alpha_long <- pivot_longer(alpha_std,
+  cols      = c("Observed", "Shannon", "Simpson", "Chao1", "ACE"),
+  names_to  = "Metric",
+  values_to = "Value"
+)
+
+ggplot(alpha_long, aes_string(x = "Group", y = "Value", fill = "Group")) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 1.5) +
+  facet_wrap(~Metric, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Standard alpha diversity metrics (rarefied)",
+       x = NULL, y = "Diversity") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## 4.2 Faith's Phylogenetic Diversity
+
+Requires a phylogenetic tree in the phyloseq object.
+
+```{r}
+#| label: faiths-pd
+if (!is.null(phy_tree(ps_rare, errorIfNULL = FALSE))) {
+  # picante-style PD: sum of branch lengths
+  otu_mat <- as.matrix(otu_table(ps_rare))
+  if (!taxa_are_rows(ps_rare)) otu_mat <- t(otu_mat)
+
+  pd_df <- picante::pd(t(otu_mat), phy_tree(ps_rare))
+  pd_df$Group  <- sample_data(ps_rare)[[group_var]]
+  pd_df$Sample <- rownames(pd_df)
+
+  p_pd <- ggplot(pd_df, aes_string(x = "Group", y = "PD", fill = "Group")) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.15, alpha = 0.6) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = "Faith's Phylogenetic Diversity", x = NULL, y = "PD") +
+    theme_bw() +
+    theme(legend.position = "none")
+  print(p_pd)
+} else {
+  message("No phylogenetic tree found – skipping Faith's PD.")
+}
+```
+
+## 4.3 Bias-corrected Richness with breakaway
+
+`breakaway` (Willis & Bunge, 2015) estimates true richness using frequency
+ratios, providing estimates that are **not** sensitive to sequencing depth.
+
+```{r}
+#| label: breakaway-richness
+message("Running breakaway richness estimation (this may take a few minutes)...")
+
+# Run on the full (non-rarefied) table
+ba_estimates <- breakaway::breakaway(ps)
+ba_summary   <- breakaway::summary(ba_estimates)
+ba_summary$Group  <- sample_data(ps)[[group_var]]
+ba_summary$Sample <- sample_names(ps)
+
+p_ba <- ggplot(ba_summary, aes_string(x = "Group", y = "estimate",
+                                        colour = "Group")) +
+  geom_boxplot(outlier.shape = NA, fill = NA) +
+  geom_point(position = position_jitter(0.15), size = 2) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.1, alpha = 0.4) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(title = "breakaway: bias-corrected richness estimates",
+       subtitle = "Error bars = 95% confidence interval",
+       x = NULL, y = "Estimated richness") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(p_ba)
+```
+
+## 4.4 breakaway betta: Group Comparison
+
+`betta()` (Willis *et al.*, 2017) regresses breakaway estimates on covariates,
+properly accounting for the uncertainty in each richness estimate.
+
+```{r}
+#| label: betta-test
+covariate_formula_str <- group_var
+if (length(covariate_vars) > 0) {
+  covariate_formula_str <- paste(c(group_var, covariate_vars), collapse = " + ")
+}
+
+meta_betta <- as.data.frame(sample_data(ps))
+
+betta_result <- breakaway::betta(
+  chats = ba_summary$estimate,
+  ses   = ba_summary$std_error,
+  X     = model.matrix(as.formula(paste("~", covariate_formula_str)),
+                        data = meta_betta)
+)
+
+cat("\n── betta regression: richness ~ ", covariate_formula_str, " ──\n")
+print(betta_result$table)
+```
+
+## 4.5 Bias-corrected Diversity with DivNet
+
+`DivNet` (Willis & Martin, 2020) estimates Shannon entropy and other diversity
+metrics while accounting for correlation between taxa using a network model.
+It provides variance estimates and enables proper hypothesis testing.
+
+```{r}
+#| label: divnet-shannon
+message("Running DivNet (Shannon + Simpson)...")
+message("  This fits a network model and may take several minutes.")
+
+# DivNet requires the non-rarefied phyloseq object
+dv <- DivNet::divnet(
+  W      = ps,
+  X      = group_var,   # grouping variable; set to NULL for no covariate
+  tuning = divnet_tuning
+)
+
+# Extract Shannon estimates
+shannon_dv <- dv$shannon %>%
+  DivNet::summary() %>%
+  as.data.frame()
+
+shannon_dv$Group  <- sample_data(ps)[[group_var]]
+shannon_dv$Sample <- sample_names(ps)
+
+p_shannon <- ggplot(shannon_dv,
+                     aes_string(x = "Group", y = "estimate", colour = "Group")) +
+  geom_boxplot(outlier.shape = NA, fill = NA) +
+  geom_point(position = position_jitter(0.15), size = 2) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.1, alpha = 0.5) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(title = "DivNet: bias-corrected Shannon entropy",
+       subtitle = "Error bars = 95% CI",
+       x = NULL, y = "Shannon H′") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+print(p_shannon)
+```
+
+```{r}
+#| label: divnet-hypothesis-test
+# Test group differences using breakaway's betta on DivNet estimates
+shannon_betta <- breakaway::betta(
+  chats = shannon_dv$estimate,
+  ses   = shannon_dv$std_error,
+  X     = model.matrix(as.formula(paste("~", group_var)),
+                        data = as.data.frame(sample_data(ps)))
+)
+
+cat("\n── DivNet + betta: Shannon diversity ~ ", group_var, " ──\n")
+print(shannon_betta$table)
+```
+
+---
+
+# 5. Beta Diversity
+
+## 5.1 Distance Matrices
+
+```{r}
+#| label: compute-distances
+dist_list <- list()
+
+# Bray-Curtis (on relative abundance)
+ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
+dist_list$bray <- phyloseq::distance(ps_rel, method = "bray")
+
+# Weighted UniFrac
+if (!is.null(phy_tree(ps, errorIfNULL = FALSE))) {
+  dist_list$wunifrac <- phyloseq::distance(ps, method = "wunifrac")
+  dist_list$unifrac  <- phyloseq::distance(ps, method = "unifrac")
+} else {
+  message("No tree – skipping UniFrac distances.")
+}
+
+# Aitchison distance (CLR-transformed Euclidean)
+pseudocount <- 0.5
+otu_clr <- microbiome::transform(ps, transform = "clr")
+dist_list$aitchison <- vegan::vegdist(t(otu_table(otu_clr)), method = "euclidean")
+
+cat("Distances computed:", paste(names(dist_list), collapse = ", "), "\n")
+```
+
+## 5.2 Ordination: PCoA / NMDS
+
+```{r}
+#| label: pcoa-plots
+#| fig-width: 12
+#| fig-height: 9
+ordination_plots <- lapply(names(dist_list), function(dist_name) {
+  ord <- ordinate(ps, method = "PCoA", distance = dist_list[[dist_name]])
+  plot_ordination(ps, ord, color = group_var) +
+    geom_point(size = 3) +
+    stat_ellipse(level = 0.95, linetype = "dashed") +
+    scale_colour_brewer(palette = "Set2") +
+    labs(title = paste("PCoA –", dist_name),
+         colour = group_var) +
+    theme_bw()
+})
+
+names(ordination_plots) <- names(dist_list)
+
+lapply(ordination_plots, print)
+```
+
+```{r}
+#| label: nmds-bray
+#| fig-width: 7
+#| fig-height: 5
+nmds_ord <- ordinate(ps_rel, method = "NMDS", distance = "bray")
+cat("NMDS stress:", nmds_ord$stress, "\n")
+
+plot_ordination(ps_rel, nmds_ord, color = group_var) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95, linetype = "dashed") +
+  annotate("text", x = Inf, y = -Inf,
+           label = sprintf("Stress = %.3f", nmds_ord$stress),
+           hjust = 1.1, vjust = -0.5) +
+  scale_colour_brewer(palette = "Set2") +
+  labs(title = "NMDS – Bray-Curtis", colour = group_var) +
+  theme_bw()
+```
+
+## 5.3 PERMANOVA
+
+PERMANOVA (adonis2) tests whether groups differ in community composition.
+
+```{r}
+#| label: permanova
+meta_df <- as.data.frame(sample_data(ps))
+
+permanova_results <- lapply(names(dist_list), function(dist_name) {
+  formula_str <- paste("dist_list[[dist_name]] ~", group_var)
+  res <- vegan::adonis2(
+    as.formula(formula_str),
+    data         = meta_df,
+    permutations = n_permutations,
+    by           = "margin"
+  )
+  cat(sprintf("\n── PERMANOVA – %s ──\n", dist_name))
+  print(res)
+  res
+})
+names(permanova_results) <- names(dist_list)
+```
+
+## 5.4 PERMDISP (Homogeneity of Dispersion)
+
+A significant PERMANOVA could reflect differences in **location** (composition)
+or **spread** (variability). PERMDISP tests whether groups have equal dispersion.
+
+```{r}
+#| label: permdisp
+for (dist_name in names(dist_list)) {
+  bd <- betadisper(dist_list[[dist_name]],
+                    group = meta_df[[group_var]])
+  disp_test <- permutest(bd, permutations = n_permutations)
+  cat(sprintf("\n── PERMDISP – %s ──\n", dist_name))
+  print(disp_test)
+  plot(bd, main = paste("PERMDISP –", dist_name))
+}
+```
+
+## 5.5 Summary Table
+
+```{r}
+#| label: permanova-summary-table
+perm_summary <- do.call(rbind, lapply(names(permanova_results), function(dist_name) {
+  res <- permanova_results[[dist_name]]
+  data.frame(
+    Distance = dist_name,
+    R2       = round(res$R2[1], 4),
+    F_stat   = round(res$F[1], 4),
+    p_value  = res$`Pr(>F)`[1],
+    stringsAsFactors = FALSE
+  )
+}))
+
+perm_summary$p_adj <- p.adjust(perm_summary$p_value, method = alpha_p_adjust)
+knitr::kable(perm_summary, caption = "PERMANOVA summary across distance metrics")
+```
+
+---
+
+# 6. Save Results
+
+```{r}
+#| label: save-results
+# Alpha diversity tables
+write.csv(alpha_std,   file.path(results_dir, "alpha_standard_rarefied.csv"),  row.names = FALSE)
+write.csv(ba_summary,  file.path(results_dir, "alpha_breakaway_richness.csv"), row.names = FALSE)
+write.csv(shannon_dv,  file.path(results_dir, "alpha_divnet_shannon.csv"),     row.names = FALSE)
+
+# Beta diversity tables
+write.csv(perm_summary, file.path(results_dir, "beta_permanova_summary.csv"), row.names = FALSE)
+
+# Save distance matrices
+for (dist_name in names(dist_list)) {
+  write.csv(as.matrix(dist_list[[dist_name]]),
+            file.path(results_dir, paste0("dist_", dist_name, ".csv")))
+}
+
+message("Diversity results saved to: ", results_dir)
+```
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

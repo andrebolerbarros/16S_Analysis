@@ -1,0 +1,24 @@
+Package: rFigaro
+Title: Optimize Trimming Parameters for Paired-End Amplicon Sequencing
+Version: 1.0.0
+Authors@R: c(
+    person("Zymo Research", role = "aut",
+           comment = "Original Python FIGARO algorithm"),
+    person("Andre", "Barros", role = c("aut", "cre"),
+           email = "asbarros@igc.gulbenkian.pt"))
+Description: R implementation of FIGARO (An efficient and objective tool for
+    optimizing microbiome rRNA gene trimming parameters). Analyzes paired-end
+    FASTQ files to determine optimal trimming settings for DADA2 and other
+    denoising pipelines by modeling expected error rates across read positions
+    and scoring all possible trim position combinations.
+License: GPL-3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Imports:
+    parallel,
+    jsonlite,
+    stats
+Suggests:
+    ShortRead,
+    ggplot2

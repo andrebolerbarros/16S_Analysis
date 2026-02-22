@@ -1,0 +1,287 @@
+---
+title: "02 – Trim Parameter Optimisation with rFigaro"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+---
+
+# Overview
+
+This notebook uses **rFigaro** – an R implementation of the FIGARO algorithm
+(Weinstein *et al.* 2019) – to determine optimal **truncation lengths**
+(`truncLen`) and **maximum expected errors** (`maxEE`) for DADA2.
+
+FIGARO scores every possible trim position combination by modelling the
+cumulative expected error across reads. The top candidates balance:
+
+1. **Read retention** (% of read pairs that survive the `maxEE` filter)
+2. **Overlap** (trimmed reads must still overlap by ≥ `min_overlap` bp)
+
+::: callout-note
+**Input:** Primer-trimmed FASTQs from notebook `01`.
+**Output:** Ranked `data.frame` of trim parameter candidates + JSON file.
+:::
+
+---
+
+# 1. User Parameters
+
+::: callout-important
+Edit this section before running.
+:::
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+trimmed_dir  <- here::here("data", "trimmed")
+figaro_dir   <- here::here("data", "figaro")   # rFigaro output directory
+
+# ── Amplicon biology ──────────────────────────────────────────────────────────
+# Length of the amplicon WITHOUT primers (bp).
+# V4 region (515F/806R): ~253 bp; V3-V4 (~460 bp); V1-V3 (~490 bp)
+amplicon_length <- 253
+
+# Primer lengths (already trimmed, so set to 0 unless primers are still present)
+# If running rFigaro on TRIMMED reads (recommended), set both to 0.
+# If running on RAW reads, specify actual primer lengths.
+forward_primer_length <- 0L
+reverse_primer_length <- 0L
+
+# ── FIGARO settings ───────────────────────────────────────────────────────────
+min_overlap     <- 20L    # Minimum paired-read overlap for merging
+percentile      <- 83L    # EE percentile for curve fitting (default 83)
+n_cores         <- 4L     # Parallel cores
+top_n           <- 20L    # Number of top candidates to report
+
+# ── File naming ────────────────────────────────────────────────────────────────
+naming_standard <- "nononsense"  # See rFigaro::figaro() docs for options
+# "nononsense" = sample_R1.fastq.gz / sample_R2.fastq.gz
+# "illumina"   = Illumina standard (sampleID_S*_L*_R{1,2}_001.fastq.gz)
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(rFigaro)
+  library(dada2)
+  library(ggplot2)
+  library(patchwork)
+  library(here)
+})
+
+dir.create(figaro_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# 3. Quality Profiles (Reminder)
+
+Visualise quality profiles of a few trimmed samples to guide your expectations.
+The rFigaro output should suggest truncation points consistent with what you
+see here.
+
+```{r}
+#| label: quality-profiles
+#| fig-width: 10
+#| fig-height: 5
+fwd_files <- sort(list.files(trimmed_dir,
+                              pattern = "_R1.*\\.fastq(\\.gz)?$",
+                              full.names = TRUE))
+rev_files <- sort(list.files(trimmed_dir,
+                              pattern = "_R2.*\\.fastq(\\.gz)?$",
+                              full.names = TRUE))
+
+if (length(fwd_files) == 0) stop("No trimmed FASTQs found in: ", trimmed_dir)
+
+n_plot <- min(4, length(fwd_files))
+idx    <- sort(sample(length(fwd_files), n_plot))
+
+p_fwd <- plotQualityProfile(fwd_files[idx]) +
+  ggtitle("Trimmed forward reads") +
+  theme_bw()
+p_rev <- plotQualityProfile(rev_files[idx]) +
+  ggtitle("Trimmed reverse reads") +
+  theme_bw()
+
+p_fwd / p_rev
+```
+
+---
+
+# 4. Run rFigaro
+
+```{r}
+#| label: run-figaro
+message("Running rFigaro on: ", trimmed_dir)
+message("  Amplicon length:  ", amplicon_length, " bp")
+message("  Minimum overlap:  ", min_overlap, " bp")
+message("  EE percentile:    ", percentile)
+
+figaro_result <- rFigaro::figaro(
+  input_directory       = trimmed_dir,
+  amplicon_length       = amplicon_length,
+  forward_primer_length = forward_primer_length,
+  reverse_primer_length = reverse_primer_length,
+  min_overlap           = min_overlap,
+  naming_standard       = naming_standard,
+  percentile            = percentile,
+  n_cores               = n_cores,
+  generate_plots        = TRUE,
+  output_directory      = figaro_dir,
+  output_filename       = "trimParameters.json",
+  top_n                 = top_n
+)
+```
+
+---
+
+# 5. Interpret Results
+
+```{r}
+#| label: print-results
+print(figaro_result)
+```
+
+```{r}
+#| label: results-table
+params_df <- figaro_result$parameters
+
+knitr::kable(
+  params_df,
+  digits  = 2,
+  caption = "rFigaro trim parameter candidates (ranked by score)",
+  col.names = c("Fwd truncLen", "Rev truncLen",
+                "Fwd maxEE", "Rev maxEE",
+                "Retention (%)", "Score")
+)
+```
+
+---
+
+# 6. Expected Error Curves
+
+These curves show the cumulative expected error as a function of read position.
+Truncation at a position just before quality deteriorates sharply maximises
+both error filtering and read retention.
+
+```{r}
+#| label: ee-plots
+#| fig-width: 10
+#| fig-height: 5
+if (!is.null(figaro_result$forward_curve$plot) &&
+    !is.null(figaro_result$reverse_curve$plot)) {
+  figaro_result$forward_curve$plot / figaro_result$reverse_curve$plot
+} else {
+  message("EE plots not available (ggplot2 may not be installed).")
+}
+```
+
+---
+
+# 7. Score vs Retention Trade-off
+
+```{r}
+#| label: score-plot
+#| fig-width: 7
+#| fig-height: 5
+ggplot(params_df,
+       aes(x = read_retention_percent,
+           y = score,
+           colour = forward_trim,
+           shape  = factor(reverse_trim))) +
+  geom_point(size = 3) +
+  scale_colour_viridis_c(name = "Fwd truncLen") +
+  labs(
+    title   = "rFigaro: score vs read retention",
+    x       = "Estimated read retention (%)",
+    y       = "FIGARO score",
+    shape   = "Rev truncLen",
+    caption = "Higher score = better; top-left is ideal"
+  ) +
+  theme_bw()
+```
+
+---
+
+# 8. Select & Record Parameters for DADA2
+
+```{r}
+#| label: select-params
+# Default: use top-ranked candidate
+best <- params_df[1, ]
+
+# ── Override here if needed (e.g. prefer higher retention) ────────────────────
+# best <- params_df[params_df$read_retention_percent >= 75, ][1, ]
+
+cat("══════════════════════════════════════════\n")
+cat("  Selected DADA2 parameters\n")
+cat("══════════════════════════════════════════\n")
+cat(sprintf("  truncLen  = c(%d, %d)\n", best$forward_trim, best$reverse_trim))
+cat(sprintf("  maxEE     = c(%d, %d)\n", best$forward_max_ee, best$reverse_max_ee))
+cat(sprintf("  Retention = %.1f%%\n",     best$read_retention_percent))
+cat(sprintf("  Score     = %.3f\n",       best$score))
+cat("══════════════════════════════════════════\n")
+```
+
+```{r}
+#| label: save-params
+# Save selected parameters for downstream use
+dada2_params <- list(
+  truncLen        = c(best$forward_trim, best$reverse_trim),
+  maxEE           = c(best$forward_max_ee, best$reverse_max_ee),
+  retention_pct   = best$read_retention_percent,
+  figaro_score    = best$score,
+  amplicon_length = amplicon_length,
+  min_overlap     = min_overlap,
+  timestamp       = Sys.time()
+)
+
+params_path <- here::here("data", "figaro", "dada2_params.rds")
+saveRDS(dada2_params, params_path)
+message("DADA2 parameters saved to: ", params_path)
+```
+
+---
+
+# 9. Notes on Quality Score Schemes
+
+::: callout-note
+**This section is informational. Action required in notebook 03.**
+:::
+
+Modern Illumina platforms differ in how they encode quality scores:
+
+| Platform | Q-score type | DADA2 implication |
+|----------|-------------|-------------------|
+| MiSeq, HiSeq | **Continuous** | Standard error model learning works well |
+| NovaSeq 6000, NextSeq | **Binned** (2-channel) | Binned scores compress quality variation; use `LOESS` smoothing or `selfConsist = TRUE` |
+
+rFigaro uses the raw Q-score distribution and is valid for **both** platforms.
+For DADA2, if your data come from a **binned** platform, you will use
+`loessErrfun` or enable `pool = TRUE` / `selfConsist = TRUE` as described in
+notebook 03.
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

@@ -1,0 +1,544 @@
+---
+title: "03 – DADA2 Processing"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+---
+
+# Overview
+
+This notebook runs the full **DADA2** pipeline (Callahan *et al.*, *Nature Methods*
+2016) on primer-trimmed paired-end reads to generate an **ASV table** (Amplicon
+Sequence Variants) and assigns taxonomy.
+
+Steps:
+
+1. Quality filtering & truncation
+2. Error model learning *(with platform-aware handling of continuous vs binned Q-scores)*
+3. Sample inference (denoising)
+4. Paired-end read merging
+5. Chimera removal
+6. Read tracking
+7. Taxonomy assignment (SILVA / GTDB)
+
+---
+
+# 1. User Parameters
+
+::: callout-important
+Edit this section before running.
+:::
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+trimmed_dir        <- here::here("data", "trimmed")
+dada2_dir          <- here::here("data", "dada2")
+figaro_params_path <- here::here("data", "figaro", "dada2_params.rds")
+
+# ── Quality score platform ────────────────────────────────────────────────────
+# Set to TRUE for NovaSeq 6000 / NextSeq (2-channel, binned Q-scores)
+# Set to FALSE for MiSeq / HiSeq (continuous Q-scores)
+binned_quality <- FALSE
+
+# ── Trim parameters ────────────────────────────────────────────────────────────
+# These are loaded from rFigaro output by default.
+# Uncomment and edit to override manually:
+# truncLen  <- c(240, 200)
+# maxEE     <- c(2, 2)
+
+# ── Additional filterAndTrim settings ─────────────────────────────────────────
+truncQ        <- 2     # Truncate at first base with Q ≤ this value
+rm_phiX       <- TRUE  # Remove PhiX spike-in reads
+min_length    <- 50    # Minimum read length after truncation
+
+# ── Merging settings ──────────────────────────────────────────────────────────
+min_overlap   <- 20    # Minimum overlap for merging
+max_mismatch  <- 0     # Maximum mismatches in overlap region (0 = exact)
+
+# ── Chimera removal ────────────────────────────────────────────────────────────
+chimera_method <- "consensus"  # "consensus" or "pooled"
+
+# ── Taxonomy ──────────────────────────────────────────────────────────────────
+# Path to SILVA reference database (download from https://zenodo.org/record/4587955)
+# or GTDB (https://forum.qiime2.org/t/gtdb-taxonomy-for-dada2/23747)
+taxonomy_db      <- "/path/to/silva_nr99_v138.1_train_set.fa.gz"
+taxonomy_species <- "/path/to/silva_species_assignment_v138.1.fa.gz"
+
+# ── Parallelism ────────────────────────────────────────────────────────────────
+n_cores <- 4L  # Number of cores (use FALSE on Windows if multiprocessing fails)
+
+# ── Pooling strategy ──────────────────────────────────────────────────────────
+# "independent" (default, fastest), "pseudo" (better sensitivity), or TRUE (pooled)
+pool_method <- "pseudo"
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(dada2)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(here)
+})
+
+dir.create(dada2_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(dada2_dir, "filtered"), recursive = TRUE, showWarnings = FALSE)
+
+message("DADA2 version: ", packageVersion("dada2"))
+```
+
+---
+
+# 3. Load rFigaro Parameters
+
+```{r}
+#| label: load-params
+if (file.exists(figaro_params_path)) {
+  figaro_params <- readRDS(figaro_params_path)
+  message("Loaded rFigaro parameters from: ", figaro_params_path)
+
+  # Use rFigaro values unless manually overridden above
+  if (!exists("truncLen")) truncLen <- figaro_params$truncLen
+  if (!exists("maxEE"))    maxEE    <- figaro_params$maxEE
+
+  cat("  truncLen:", truncLen, "\n")
+  cat("  maxEE:   ", maxEE,    "\n")
+  cat("  Estimated read retention:", figaro_params$retention_pct, "%\n")
+} else {
+  warning("rFigaro parameter file not found. Using manually defined truncLen/maxEE.")
+  if (!exists("truncLen") || !exists("maxEE")) {
+    stop("Please define `truncLen` and `maxEE` in the User Parameters section.")
+  }
+}
+
+cat("\n── Platform quality score scheme ──\n")
+if (binned_quality) {
+  cat("  Binned Q-scores (NovaSeq/NextSeq)\n")
+  cat("  → Will use loessErrfun or selfConsist error modelling.\n")
+} else {
+  cat("  Continuous Q-scores (MiSeq/HiSeq)\n")
+  cat("  → Standard DADA2 error modelling.\n")
+}
+```
+
+---
+
+# 4. Locate Trimmed FASTQs
+
+```{r}
+#| label: list-fastqs
+fwd_trimmed <- sort(list.files(trimmed_dir,
+                                pattern = "_R1.*\\.fastq(\\.gz)?$",
+                                full.names = TRUE))
+rev_trimmed <- sort(list.files(trimmed_dir,
+                                pattern = "_R2.*\\.fastq(\\.gz)?$",
+                                full.names = TRUE))
+
+if (length(fwd_trimmed) == 0) stop("No trimmed FASTQs found in: ", trimmed_dir)
+stopifnot(length(fwd_trimmed) == length(rev_trimmed))
+
+sample_names <- sub("_R1.*", "", basename(fwd_trimmed))
+sample_names <- gsub("[._-]$", "", sample_names)
+
+cat("Samples:", length(sample_names), "\n")
+```
+
+---
+
+# 5. Quality Filtering and Truncation
+
+```{r}
+#| label: filter-paths
+fwd_filt <- file.path(dada2_dir, "filtered", paste0(sample_names, "_F_filt.fastq.gz"))
+rev_filt <- file.path(dada2_dir, "filtered", paste0(sample_names, "_R_filt.fastq.gz"))
+names(fwd_filt) <- sample_names
+names(rev_filt) <- sample_names
+```
+
+```{r}
+#| label: filter-and-trim
+out <- filterAndTrim(
+  fwd         = fwd_trimmed,
+  filt        = fwd_filt,
+  rev         = rev_trimmed,
+  filt.rev    = rev_filt,
+  truncLen    = truncLen,
+  maxEE       = maxEE,
+  truncQ      = truncQ,
+  rm.phix     = rm_phiX,
+  minLen      = min_length,
+  compress    = TRUE,
+  multithread = n_cores
+)
+
+rownames(out) <- sample_names
+knitr::kable(out, caption = "Reads in/out after filterAndTrim")
+```
+
+```{r}
+#| label: filter-check
+# Remove samples with zero reads after filtering
+kept <- out[, "reads.out"] > 0
+if (any(!kept)) {
+  warning("Samples with zero reads after filtering: ",
+          paste(rownames(out)[!kept], collapse = ", "))
+  fwd_filt     <- fwd_filt[kept]
+  rev_filt     <- rev_filt[kept]
+  sample_names <- sample_names[kept]
+  out          <- out[kept, ]
+}
+```
+
+---
+
+# 6. Error Model Learning
+
+## 6a. Continuous Q-scores (MiSeq / HiSeq)
+
+Standard DADA2 parametric error model. Learn errors separately for forward
+and reverse reads.
+
+```{r}
+#| label: error-learning-continuous
+#| eval: !expr binned_quality
+message("Learning error rates (continuous Q-scores)...")
+
+err_fwd <- learnErrors(fwd_filt,
+                        multithread = n_cores,
+                        randomize   = TRUE)
+err_rev <- learnErrors(rev_filt,
+                        multithread = n_cores,
+                        randomize   = TRUE)
+```
+
+## 6b. Binned Q-scores (NovaSeq / NextSeq)
+
+NovaSeq and NextSeq use 2-channel chemistry that collapses quality scores into
+a small number of bins (typically 4 bins: 2, 11, 25, 37). This violates
+assumptions of the standard DADA2 error model.
+
+**Strategy:** Use `LOESS` smoothing (`loessErrfun`) to flexibly model the
+observed error rates instead of fitting a parametric function.
+
+Reference: <https://github.com/ErnakovichLab/dada2_ernakovichlab>
+
+```{r}
+#| label: error-learning-binned
+#| eval: !expr !binned_quality
+message("Learning error rates (binned Q-scores – NovaSeq/NextSeq)...")
+
+# For binned platforms, selfConsist iterates the error model to convergence;
+# combine with loessErrfun for non-parametric error curve fitting.
+err_fwd <- learnErrors(
+  fwd_filt,
+  errorEstimationFunction = loessErrfun,
+  multithread  = n_cores,
+  randomize    = TRUE,
+  MAX_CONSIST  = 20,   # Extra iterations for convergence
+  OMEGA_C      = 0     # Disable low-count smoothing (helps with binned data)
+)
+
+err_rev <- learnErrors(
+  rev_filt,
+  errorEstimationFunction = loessErrfun,
+  multithread  = n_cores,
+  randomize    = TRUE,
+  MAX_CONSIST  = 20,
+  OMEGA_C      = 0
+)
+```
+
+## 6c. Error Model Diagnostics
+
+```{r}
+#| label: error-plots
+#| fig-width: 10
+#| fig-height: 5
+p_err_fwd <- plotErrors(err_fwd, nominalQ = TRUE) +
+  ggtitle("Forward read error model") +
+  theme_bw()
+p_err_rev <- plotErrors(err_rev, nominalQ = TRUE) +
+  ggtitle("Reverse read error model") +
+  theme_bw()
+
+p_err_fwd / p_err_rev
+```
+
+::: callout-note
+Points should roughly follow the lines (estimated error rates). Systematic
+deviations may indicate a poor model fit, especially on binned-quality data.
+:::
+
+---
+
+# 7. Sample Inference (Denoising)
+
+DADA2 resolves true biological sequences from sequencing errors.
+
+**Pooling options:**
+
+- `"independent"` – fastest; each sample analysed alone
+- `"pseudo"` – two-pass approach; improves sensitivity for rare variants
+- `TRUE` – full pooling; maximum sensitivity, but memory-intensive
+
+```{r}
+#| label: denoise
+message("Running DADA2 sample inference (pool = '", pool_method, "')...")
+
+dada_fwd <- dada(fwd_filt, err = err_fwd,
+                  multithread = n_cores,
+                  pool        = pool_method)
+dada_rev <- dada(rev_filt, err = err_rev,
+                  multithread = n_cores,
+                  pool        = pool_method)
+
+# Summary of denoised sequences for first sample
+dada_fwd[[1]]
+```
+
+---
+
+# 8. Merge Paired Reads
+
+```{r}
+#| label: merge
+message("Merging paired-end reads...")
+
+mergers <- mergePairs(
+  dadaF       = dada_fwd,
+  derepF      = fwd_filt,
+  dadaR       = dada_rev,
+  derepR      = rev_filt,
+  minOverlap  = min_overlap,
+  maxMismatch = max_mismatch,
+  verbose     = TRUE
+)
+
+# Fraction of reads successfully merged (first sample)
+cat(sprintf("Sample 1 – Accepted mergers: %d / %d (%.1f%%)\n",
+            sum(mergers[[1]]$accept),
+            nrow(mergers[[1]]),
+            100 * mean(mergers[[1]]$accept)))
+```
+
+---
+
+# 9. ASV Table Construction
+
+```{r}
+#| label: make-seqtab
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)  # samples × ASVs
+```
+
+```{r}
+#| label: seqlen-distribution
+#| fig-width: 7
+#| fig-height: 4
+seq_lengths <- nchar(getSequences(seqtab))
+seq_len_df  <- as.data.frame(table(seq_lengths))
+colnames(seq_len_df) <- c("Length", "Count")
+seq_len_df$Length <- as.integer(as.character(seq_len_df$Length))
+
+ggplot(seq_len_df, aes(x = Length, y = Count)) +
+  geom_col(fill = "steelblue") +
+  geom_vline(xintercept = c(250, 255), linetype = "dashed", colour = "red") +
+  labs(title = "ASV length distribution",
+       subtitle = "Dashed lines indicate expected amplicon range",
+       x = "Sequence length (bp)", y = "Number of ASVs") +
+  theme_bw()
+```
+
+```{r}
+#| label: trim-off-target
+# Remove off-target length sequences (optional but recommended)
+# Adjust the range to match your expected amplicon length
+expected_range <- c(245, 260)  # bp – edit for your target region
+
+seqtab_len <- seqtab[, nchar(colnames(seqtab)) %in% seq(expected_range[1], expected_range[2])]
+cat(sprintf("ASVs before length filter: %d\n", ncol(seqtab)))
+cat(sprintf("ASVs after  length filter: %d\n", ncol(seqtab_len)))
+```
+
+---
+
+# 10. Chimera Removal
+
+```{r}
+#| label: remove-chimeras
+message("Removing chimeras (method = '", chimera_method, "')...")
+
+seqtab_nochim <- removeBimeraDenovo(
+  seqtab_len,
+  method      = chimera_method,
+  multithread = n_cores,
+  verbose     = TRUE
+)
+
+cat(sprintf("ASVs before chimera removal: %d\n", ncol(seqtab_len)))
+cat(sprintf("ASVs after  chimera removal: %d\n", ncol(seqtab_nochim)))
+cat(sprintf("Reads retained: %.1f%%\n", 100 * sum(seqtab_nochim) / sum(seqtab_len)))
+```
+
+---
+
+# 11. Read Tracking
+
+```{r}
+#| label: read-tracking
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(
+  out,
+  sapply(dada_fwd, getN),
+  sapply(dada_rev, getN),
+  sapply(mergers,  getN),
+  rowSums(seqtab_nochim)
+)
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample_names
+
+knitr::kable(track, caption = "Read tracking through DADA2 pipeline")
+```
+
+```{r}
+#| label: tracking-plot
+#| fig-width: 9
+#| fig-height: 5
+track_df <- as.data.frame(track)
+track_df$Sample <- rownames(track_df)
+
+track_long <- tidyr::pivot_longer(
+  track_df,
+  cols      = -Sample,
+  names_to  = "Step",
+  values_to = "Reads"
+)
+track_long$Step <- factor(track_long$Step,
+                            levels = c("input","filtered","denoisedF",
+                                       "denoisedR","merged","nonchim"))
+
+ggplot(track_long, aes(x = Step, y = Reads, group = Sample, colour = Sample)) +
+  geom_line(alpha = 0.6) +
+  geom_point(size = 1.5) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Read retention through DADA2 pipeline",
+       x = "Pipeline step", y = "Read count") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r}
+#| label: low-retention-check
+retention_pct <- 100 * track[, "nonchim"] / track[, "input"]
+low_ret <- names(retention_pct[retention_pct < 50])
+if (length(low_ret) > 0) {
+  warning("Samples with < 50% read retention:\n  ",
+          paste(low_ret, collapse = "\n  "))
+} else {
+  message("All samples retained >= 50% of reads. Good.")
+}
+```
+
+---
+
+# 12. Taxonomy Assignment
+
+Taxonomy is assigned using DADA2's `assignTaxonomy()` function with the SILVA
+(or GTDB) reference database, followed by `addSpecies()` for species-level
+exact matching.
+
+```{r}
+#| label: assign-taxonomy
+if (!file.exists(taxonomy_db)) {
+  warning("Taxonomy database not found: ", taxonomy_db,
+          "\nSkipping taxonomy assignment. Update `taxonomy_db` in User Parameters.")
+  taxa <- NULL
+} else {
+  message("Assigning taxonomy (this may take several minutes)...")
+
+  taxa <- assignTaxonomy(
+    seqtab_nochim,
+    refFasta    = taxonomy_db,
+    multithread = n_cores,
+    minBoot     = 80,    # Bootstrap confidence threshold
+    verbose     = TRUE
+  )
+
+  if (file.exists(taxonomy_species)) {
+    taxa <- addSpecies(taxa, taxonomy_species, verbose = TRUE)
+  }
+
+  cat("Taxonomy summary:\n")
+  print(table(!is.na(taxa[, "Phylum"])))
+}
+```
+
+```{r}
+#| label: taxa-preview
+if (!is.null(taxa)) {
+  knitr::kable(
+    head(taxa[, c("Kingdom","Phylum","Class","Order","Family","Genus")], 10),
+    caption = "First 10 ASVs taxonomy"
+  )
+}
+```
+
+---
+
+# 13. Save Outputs
+
+```{r}
+#| label: save-outputs
+saveRDS(seqtab_nochim, file.path(dada2_dir, "seqtab_nochim.rds"))
+if (!is.null(taxa)) saveRDS(taxa, file.path(dada2_dir, "taxa.rds"))
+write.csv(track, file.path(dada2_dir, "track_reads.csv"))
+
+# Save ASV table as a plain CSV (rows = samples, columns = ASV hashes)
+asv_tab <- as.data.frame(t(seqtab_nochim))
+rownames(asv_tab) <- paste0("ASV", seq_len(nrow(asv_tab)))
+write.csv(asv_tab, file.path(dada2_dir, "asv_table.csv"))
+
+# Save ASV sequences as FASTA
+asv_seqs <- colnames(seqtab_nochim)
+asv_ids   <- paste0("ASV", seq_along(asv_seqs))
+asv_fasta <- file.path(dada2_dir, "asvs.fasta")
+writeLines(paste0(">", asv_ids, "\n", asv_seqs), asv_fasta)
+
+message("Outputs saved to: ", dada2_dir)
+message("  seqtab_nochim.rds  – sequence table (samples × ASVs)")
+message("  taxa.rds           – taxonomy matrix")
+message("  track_reads.csv    – read tracking")
+message("  asv_table.csv      – ASV counts (transposed)")
+message("  asvs.fasta         – ASV sequences")
+```
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

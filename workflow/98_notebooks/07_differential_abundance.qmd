@@ -1,0 +1,573 @@
+---
+title: "07 – Differential Abundance Analysis"
+subtitle: "16S Amplicon Sequencing Analysis Pipeline"
+author: "Fundação GIMM – Gulbenkian Institute for Molecular Medicine"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    theme: flatly
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  message: true
+  warning: false
+  fig-width: 9
+  fig-height: 6
+---
+
+# Overview
+
+This notebook identifies taxa that are differentially abundant between groups
+using two complementary compositional approaches:
+
+1. **ANCOM-BC2** (Lin & Peddada 2020; Cao *et al.* 2023) – a log-linear model
+   with bias correction that accounts for the compositional nature of
+   microbiome data and provides FDR control. This is the primary method.
+
+2. **Dirichlet regression** (`DirichletReg`) – models count proportions
+   directly under the Dirichlet distribution. Useful as a confirmatory
+   approach for taxa significant in ANCOM-BC2.
+
+::: callout-note
+DESeq2 is intentionally excluded because its negative binomial model treats
+library sizes as absolute scales. For compositional data, ANCOM-BC2 is more
+appropriate and less prone to false positives.
+:::
+
+---
+
+# 1. User Parameters
+
+```{r}
+#| label: params
+# ── Paths ─────────────────────────────────────────────────────────────────────
+phyloseq_dir   <- here::here("data", "phyloseq")
+ps_path        <- file.path(phyloseq_dir, "ps.rds")
+da_results_dir <- here::here("data", "differential_abundance")
+
+# ── Study design ──────────────────────────────────────────────────────────────
+group_var     <- "Group"     # Primary grouping variable
+reference_lvl <- NULL        # Reference level for pairwise comparisons.
+                              # NULL = first alphabetical level
+
+# Additional fixed effects (e.g., batch, sex) – set to NULL if not needed
+fixed_effects <- NULL        # e.g., c("Batch", "Sex")
+
+# ── Taxonomic level for analysis ──────────────────────────────────────────────
+# For ANCOM-BC2: run on ASV level; we also repeat on Genus & Family
+tax_levels <- c("ASV", "Genus", "Family")
+
+# ── Minimum prevalence filter (before DA testing) ─────────────────────────────
+# Keep only taxa present in >= this fraction of samples
+prev_threshold <- 0.10   # 10% of samples
+
+# ── ANCOM-BC2 settings ────────────────────────────────────────────────────────
+ancombc2_alpha  <- 0.05   # FDR threshold
+ancombc2_n_boot <- 1000   # Bootstrap iterations for sensitivity analysis
+                            # (set to 0 to skip sensitivity, much faster)
+
+# ── Dirichlet regression settings ─────────────────────────────────────────────
+# Collapse to genus level for Dirichlet (ASV level is too sparse)
+dirichlet_tax_level <- "Genus"
+dirichlet_top_n     <- 40    # Top N genera by mean abundance to include
+dirichlet_alpha     <- 0.05
+```
+
+---
+
+# 2. Setup
+
+```{r}
+#| label: libraries
+suppressPackageStartupMessages({
+  library(phyloseq)
+  library(ANCOMBC)
+  library(DirichletReg)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(here)
+})
+
+dir.create(da_results_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# 3. Load and Prepare Data
+
+```{r}
+#| label: load-ps
+ps <- readRDS(ps_path)
+ps
+```
+
+```{r}
+#| label: set-reference
+if (!is.null(reference_lvl)) {
+  meta <- as.data.frame(sample_data(ps))
+  meta[[group_var]] <- relevel(factor(meta[[group_var]]), ref = reference_lvl)
+  sample_data(ps) <- sample_data(meta)
+  cat("Reference level set to:", reference_lvl, "\n")
+} else {
+  cat("Reference level: first alphabetical (",
+      sort(unique(as.data.frame(sample_data(ps))[[group_var]]))[1], ")\n")
+}
+```
+
+---
+
+# 4. ANCOM-BC2
+
+ANCOM-BC2 (Analysis of Compositions of Microbiomes with Bias Correction 2) is
+a log-linear model that:
+
+- Estimates and corrects for **sampling fractions** (library-size bias)
+- Controls FDR via multiple testing correction
+- Provides **sensitivity analysis** (pattern-based) to flag robust findings
+- Supports pairwise comparisons, global tests, and continuous outcomes
+
+Reference: Cao Y *et al.* (2023) *F1000Research* 13:369.
+
+## 4.1 ASV-level ANCOM-BC2
+
+```{r}
+#| label: ancombc2-asvs
+# Build formula
+formula_str <- group_var
+if (!is.null(fixed_effects)) {
+  formula_str <- paste(c(formula_str, fixed_effects), collapse = " + ")
+}
+cat("ANCOM-BC2 formula: ~", formula_str, "\n")
+
+# Prevalence filter
+ps_prev <- phyloseq::filter_taxa(
+  ps,
+  function(x) mean(x > 0) >= prev_threshold,
+  prune = TRUE
+)
+cat(sprintf("ASVs after prevalence filter (>= %.0f%%): %d\n",
+            100 * prev_threshold, ntaxa(ps_prev)))
+
+message("Running ANCOM-BC2 at ASV level...")
+
+ancom_asv <- ANCOMBC::ancombc2(
+  data          = ps_prev,
+  assay_name    = "counts",
+  tax_level     = NULL,   # NULL = use taxa as-is (ASV level)
+  fix_formula   = formula_str,
+  rand_formula  = NULL,
+  p_adj_method  = "BH",
+  prv_cut       = 0,
+  lib_cut       = 0,
+  s0_perc       = 0.05,
+  group         = group_var,
+  struc_zero    = TRUE,
+  neg_lb        = TRUE,
+  alpha         = ancombc2_alpha,
+  n_cl          = 1,
+  verbose       = TRUE,
+  global        = TRUE,
+  pairwise      = TRUE,
+  dunnet        = FALSE,
+  trend         = FALSE,
+  iter_control  = list(tol = 0.01, max_iter = 20, verbose = FALSE),
+  em_control    = list(tol = 1e-5, max_iter = 100),
+  lme_control   = NULL,
+  mdfdr_control = list(fwer_ctrl_method = "BH", B = ancombc2_n_boot),
+  trend_control = list(contrast = NULL, node = NULL, solver = "ECOS", B = 100)
+)
+```
+
+```{r}
+#| label: ancombc2-asv-results
+res_asv <- ancom_asv$res
+cat(sprintf("\nSignificant ASVs (q < %.2f):\n", ancombc2_alpha))
+
+sig_cols <- grep("^diff_", colnames(res_asv), value = TRUE)
+for (col in sig_cols) {
+  n_sig <- sum(res_asv[[col]], na.rm = TRUE)
+  cat(sprintf("  %s: %d significant\n", sub("diff_", "", col), n_sig))
+}
+```
+
+## 4.2 Genus-level ANCOM-BC2
+
+Running ANCOM-BC2 at genus level provides a higher-level summary and increases
+power by aggregating sparse ASV counts.
+
+```{r}
+#| label: ancombc2-genus
+message("Running ANCOM-BC2 at Genus level...")
+
+ancom_genus <- ANCOMBC::ancombc2(
+  data         = ps_prev,
+  assay_name   = "counts",
+  tax_level    = "Genus",
+  fix_formula  = formula_str,
+  p_adj_method = "BH",
+  prv_cut      = 0,
+  lib_cut      = 0,
+  s0_perc      = 0.05,
+  group        = group_var,
+  struc_zero   = TRUE,
+  neg_lb       = TRUE,
+  alpha        = ancombc2_alpha,
+  n_cl         = 1,
+  verbose      = FALSE,
+  global       = TRUE,
+  pairwise     = TRUE,
+  dunnet       = FALSE,
+  trend        = FALSE,
+  iter_control = list(tol = 0.01, max_iter = 20, verbose = FALSE),
+  em_control   = list(tol = 1e-5, max_iter = 100)
+)
+
+res_genus <- ancom_genus$res
+cat(sprintf("\nGenera tested: %d\n", nrow(res_genus)))
+
+sig_genus_cols <- grep("^diff_", colnames(res_genus), value = TRUE)
+for (col in sig_genus_cols) {
+  n_sig <- sum(res_genus[[col]], na.rm = TRUE)
+  cat(sprintf("  %s: %d significant\n", sub("diff_", "", col), n_sig))
+}
+```
+
+## 4.3 Visualise ANCOM-BC2 Results
+
+### Volcano Plot (Genus level)
+
+```{r}
+#| label: ancombc2-volcano
+#| fig-width: 8
+#| fig-height: 6
+lfc_col  <- grep("^lfc_",  colnames(res_genus), value = TRUE)[1]
+se_col   <- grep("^se_",   colnames(res_genus), value = TRUE)[1]
+q_col    <- grep("^q_",    colnames(res_genus), value = TRUE)[1]
+diff_col <- grep("^diff_", colnames(res_genus), value = TRUE)[1]
+
+if (!is.na(lfc_col)) {
+  volcano_df <- res_genus %>%
+    select(taxon, all_of(c(lfc_col, se_col, q_col, diff_col))) %>%
+    setNames(c("Taxon", "LFC", "SE", "q", "Significant")) %>%
+    mutate(
+      q         = replace_na(q, 1),
+      Direction = case_when(
+        Significant & LFC > 0 ~ "Enriched",
+        Significant & LFC < 0 ~ "Depleted",
+        TRUE                  ~ "NS"
+      )
+    )
+
+  top_labels <- volcano_df %>%
+    filter(Significant) %>%
+    arrange(q) %>%
+    head(15)
+
+  ggplot(volcano_df, aes(x = LFC, y = -log10(q), colour = Direction)) +
+    geom_point(alpha = 0.6, size = 2.5) +
+    geom_hline(yintercept = -log10(ancombc2_alpha),
+               linetype = "dashed", colour = "grey40") +
+    geom_vline(xintercept = 0, linetype = "solid", colour = "grey40") +
+    ggrepel::geom_text_repel(data = top_labels,
+                              aes(label = Taxon), size = 3, max.overlaps = 20) +
+    scale_colour_manual(values = c(Enriched = "#E64B35", Depleted = "#4DBBD5",
+                                    NS = "grey70")) +
+    labs(
+      title    = "ANCOM-BC2 – Volcano plot (Genus level)",
+      subtitle = sub("lfc_", "", lfc_col),
+      x        = "Log2 fold change",
+      y        = expression(-log[10](q)),
+      colour   = NULL
+    ) +
+    theme_bw()
+}
+```
+
+### Heatmap of Top Significant Genera
+
+```{r}
+#| label: ancombc2-heatmap
+#| fig-width: 9
+#| fig-height: 7
+if (!is.na(diff_col)) {
+  sig_genera <- res_genus$taxon[res_genus[[diff_col]] == TRUE]
+
+  if (length(sig_genera) > 0) {
+    lfc_plot_df <- res_genus %>%
+      filter(taxon %in% sig_genera) %>%
+      select(taxon, all_of(grep("^lfc_", colnames(res_genus), value = TRUE)))
+
+    lfc_long <- pivot_longer(lfc_plot_df,
+                              cols      = -taxon,
+                              names_to  = "Contrast",
+                              values_to = "LFC") %>%
+      mutate(Contrast = sub("lfc_", "", Contrast))
+
+    ggplot(lfc_long, aes(x = Contrast, y = taxon, fill = LFC)) +
+      geom_tile(colour = "white") +
+      scale_fill_gradient2(low = "#4DBBD5", mid = "white", high = "#E64B35",
+                            midpoint = 0) +
+      labs(title = "ANCOM-BC2 – Log fold change heatmap (significant genera)",
+           x = "Contrast", y = "Genus", fill = "LFC") +
+      theme_bw() +
+      theme(axis.text.y = element_text(size = 8),
+            axis.text.x = element_text(angle = 30, hjust = 1))
+  } else {
+    message("No significant genera to display in heatmap.")
+  }
+}
+```
+
+### Bar Chart: Top Differential Genera
+
+```{r}
+#| label: ancombc2-barplot
+#| fig-width: 8
+#| fig-height: 6
+if (!is.na(lfc_col)) {
+  top_da_genera <- res_genus %>%
+    filter(!is.na(.data[[q_col]])) %>%
+    arrange(.data[[q_col]]) %>%
+    head(20) %>%
+    mutate(
+      Direction = ifelse(.data[[lfc_col]] > 0, "Enriched", "Depleted"),
+      Taxon     = reorder(taxon, .data[[lfc_col]])
+    )
+
+  ggplot(top_da_genera, aes(x = Taxon, y = .data[[lfc_col]],
+                              fill = Direction)) +
+    geom_col() +
+    geom_errorbar(aes(ymin = .data[[lfc_col]] - 1.96 * .data[[se_col]],
+                      ymax = .data[[lfc_col]] + 1.96 * .data[[se_col]]),
+                  width = 0.3) +
+    coord_flip() +
+    scale_fill_manual(values = c(Enriched = "#E64B35", Depleted = "#4DBBD5")) +
+    labs(title = "ANCOM-BC2 – Top 20 differential genera",
+         subtitle = paste("Contrast:", sub("lfc_", "", lfc_col)),
+         x = NULL, y = "Log2 fold change (± 95% CI)") +
+    theme_bw() +
+    theme(legend.position = "none")
+}
+```
+
+## 4.4 ANCOM-BC2 Sensitivity Analysis
+
+```{r}
+#| label: ancombc2-sensitivity
+if (!is.null(ancom_genus$res_global) && ancombc2_n_boot > 0) {
+  cat("\nGlobal test results:\n")
+  global_res <- ancom_genus$res_global
+  cat(sprintf("Genera with significant global test: %d\n",
+              sum(global_res$diff_abn, na.rm = TRUE)))
+}
+
+if (!is.null(ancom_genus$res_pair)) {
+  cat("\nPairwise test summary:\n")
+  pair_res <- ancom_genus$res_pair
+  sig_pair_cols <- grep("^diff_", colnames(pair_res), value = TRUE)
+  for (col in sig_pair_cols) {
+    cat(sprintf("  %s: %d\n", sub("diff_", "", col),
+                sum(pair_res[[col]], na.rm = TRUE)))
+  }
+}
+```
+
+---
+
+# 5. Dirichlet Regression
+
+Dirichlet regression models the proportional composition of the microbiome
+under the Dirichlet distribution, naturally handling the compositional
+constraint without log-ratio transformation.
+
+We apply it at the genus level, using only the top genera to keep the model
+tractable. It serves as a **confirmatory** method for ANCOM-BC2 findings.
+
+## 5.1 Prepare Genus-level Data
+
+```{r}
+#| label: dirichlet-prep
+# Aggregate to genus level
+ps_genus_dr <- tax_glom(ps, "Genus")
+
+# Select top N genera by mean abundance
+top_genera  <- names(sort(taxa_sums(ps_genus_dr), decreasing = TRUE))[1:dirichlet_top_n]
+ps_genus_dr <- prune_taxa(top_genera, ps_genus_dr)
+
+# Convert to proportions (Dirichlet requires compositional data)
+ps_prop <- transform_sample_counts(ps_genus_dr, function(x) x / sum(x))
+
+otu_prop     <- as.data.frame(t(otu_table(ps_prop)))
+colnames(otu_prop) <- paste0("g", seq_len(ncol(otu_prop)))
+genus_labels <- as.vector(tax_table(ps_genus_dr)[, "Genus"])
+
+meta_dr <- as.data.frame(sample_data(ps_genus_dr))
+meta_dr[[group_var]] <- factor(meta_dr[[group_var]])
+
+# DirichletReg needs a DirichletRegData object
+dr_data <- cbind(meta_dr, otu_prop)
+Y <- DirichletReg::DR_data(dr_data[, colnames(otu_prop)])
+
+cat("Dirichlet input: ", nrow(dr_data), "samples ×",
+    ncol(otu_prop), "genera\n")
+```
+
+## 5.2 Fit Dirichlet Regression Model
+
+```{r}
+#| label: dirichlet-fit
+formula_dr <- as.formula(paste("Y ~", group_var))
+if (!is.null(fixed_effects)) {
+  formula_dr <- as.formula(paste("Y ~", paste(c(group_var, fixed_effects), collapse = " + ")))
+}
+
+message("Fitting Dirichlet regression (this may take a few minutes)...")
+
+dr_model <- DirichletReg::DirichReg(
+  formula_dr,
+  data  = dr_data,
+  model = "alternative"  # "alternative" parameterisation for covariate effects
+)
+
+summary_dr <- summary(dr_model)
+```
+
+## 5.3 Extract Significant Associations
+
+```{r}
+#| label: dirichlet-results
+coef_table    <- summary_dr$coef.mat
+group_levels  <- levels(meta_dr[[group_var]])[-1]
+group_pattern <- paste(group_var, group_levels, sep = "", collapse = "|")
+
+dr_results <- do.call(rbind, lapply(seq_along(genus_labels), function(i) {
+  genus     <- genus_labels[i]
+  all_rows  <- rownames(coef_table)
+  relevant_rows <- grep(group_pattern, all_rows)
+  if (length(relevant_rows) == 0) return(NULL)
+
+  row_data <- coef_table[relevant_rows, , drop = FALSE]
+
+  do.call(rbind, lapply(seq_len(nrow(row_data)), function(j) {
+    data.frame(
+      Genus    = genus,
+      Contrast = rownames(row_data)[j],
+      Estimate = row_data[j, "Estimate"],
+      SE       = row_data[j, "Std. Error"],
+      z        = row_data[j, "z value"],
+      p_value  = row_data[j, "Pr(>|z|)"],
+      stringsAsFactors = FALSE
+    )
+  }))
+}))
+
+dr_results <- dr_results %>%
+  mutate(q_value = p.adjust(p_value, method = "BH")) %>%
+  arrange(q_value)
+
+cat(sprintf("\nSignificant genera (Dirichlet, q < %.2f): %d\n",
+            dirichlet_alpha,
+            sum(dr_results$q_value < dirichlet_alpha, na.rm = TRUE)))
+
+knitr::kable(
+  filter(dr_results, q_value < dirichlet_alpha),
+  digits  = 4,
+  caption = paste("Dirichlet regression – significant genera (q <",
+                  dirichlet_alpha, ")")
+)
+```
+
+```{r}
+#| label: dirichlet-volcano
+#| fig-width: 7
+#| fig-height: 5
+ggplot(dr_results, aes(x = Estimate, y = -log10(q_value),
+                        colour = q_value < dirichlet_alpha)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  geom_hline(yintercept = -log10(dirichlet_alpha),
+             linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("FALSE" = "grey70", "TRUE" = "#E64B35"),
+                      labels = c("NS", "Significant"), name = NULL) +
+  ggrepel::geom_text_repel(
+    data = filter(dr_results, q_value < dirichlet_alpha),
+    aes(label = Genus), size = 3, max.overlaps = 15
+  ) +
+  labs(title = "Dirichlet regression – Volcano plot (Genus level)",
+       x = "Coefficient estimate", y = expression(-log[10](q))) +
+  theme_bw()
+```
+
+---
+
+# 6. Comparison: ANCOM-BC2 vs Dirichlet Regression
+
+```{r}
+#| label: compare-methods
+sig_ancombc2 <- if (!is.na(diff_col)) {
+  res_genus$taxon[res_genus[[diff_col]] == TRUE & !is.na(res_genus[[diff_col]])]
+} else {
+  character(0)
+}
+
+sig_dirichlet <- dr_results$Genus[dr_results$q_value < dirichlet_alpha &
+                                     !is.na(dr_results$q_value)]
+
+both   <- intersect(sig_ancombc2, sig_dirichlet)
+only_a <- setdiff(sig_ancombc2, sig_dirichlet)
+only_d <- setdiff(sig_dirichlet, sig_ancombc2)
+
+cat("── Method concordance ──────────────────────────────\n")
+cat(sprintf("  Significant in ANCOM-BC2 only:      %d genera\n", length(only_a)))
+cat(sprintf("  Significant in Dirichlet only:      %d genera\n", length(only_d)))
+cat(sprintf("  Significant in BOTH methods:        %d genera\n", length(both)))
+cat("────────────────────────────────────────────────────\n")
+
+if (length(both) > 0) {
+  cat("Genera significant in both methods:\n  ",
+      paste(both, collapse = ", "), "\n")
+}
+```
+
+---
+
+# 7. Save Results
+
+```{r}
+#| label: save-results
+# ANCOM-BC2 results
+write.csv(res_asv,   file.path(da_results_dir, "ancombc2_asv.csv"),   row.names = FALSE)
+write.csv(res_genus, file.path(da_results_dir, "ancombc2_genus.csv"), row.names = FALSE)
+
+# Dirichlet results
+write.csv(dr_results, file.path(da_results_dir, "dirichlet_genus.csv"), row.names = FALSE)
+
+# Concordance summary
+concordance <- data.frame(
+  Genus     = unique(c(sig_ancombc2, sig_dirichlet)),
+  ANCOMBC2  = unique(c(sig_ancombc2, sig_dirichlet)) %in% sig_ancombc2,
+  Dirichlet = unique(c(sig_ancombc2, sig_dirichlet)) %in% sig_dirichlet
+)
+concordance$Both <- concordance$ANCOMBC2 & concordance$Dirichlet
+write.csv(concordance, file.path(da_results_dir, "concordance_summary.csv"), row.names = FALSE)
+
+# Save ANCOM-BC2 model objects
+saveRDS(ancom_asv,   file.path(da_results_dir, "ancombc2_asv_model.rds"))
+saveRDS(ancom_genus, file.path(da_results_dir, "ancombc2_genus_model.rds"))
+
+message("Differential abundance results saved to: ", da_results_dir)
+```
+
+---
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
