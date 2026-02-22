@@ -2,6 +2,8 @@
 
 **Note:** As 2026-02-22, this repository was heavily developed by AI (specifically Claude Code). Prompt is located on [`docs/00_AI_generated/README.md`](docs/00_AI_generated/README.md). This repository is under user's (André Barros) review.
 
+---
+
 This repository presents an R-based pipeline for processing and analysing 16S rRNA gene amplicon sequencing data. The pipeline covers the complete workflow from raw reads to ecological statistics and differential abundance testing.
 
 ## Repository Structure
